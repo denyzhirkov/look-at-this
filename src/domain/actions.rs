@@ -4,7 +4,7 @@ use crate::domain::keys;
 use crate::domain::policy::AccessPolicy;
 use crate::domain::session::{Error, Session};
 use crate::domain::viewport::clamp_to_window;
-use crate::ports::{Button, Key, KeyCombo, Modifiers, Point, Rect, UiAction, WindowInfo};
+use crate::ports::{Button, ElementHandle, Key, KeyCombo, Modifiers, Point, Rect, UiAction, WindowInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
@@ -48,7 +48,9 @@ impl Session {
                 Button::Left => (UiAction::Press, "pressed"),
                 Button::Right => (UiAction::ShowMenu, "opened the context menu of"),
             };
+            let cursor = self.cursor_point(&window, handle);
             if self.ports.actions.perform(handle, action).map_err(Error::System)? {
+                self.show_cursor(cursor);
                 return Ok(format!("{done} {reference} through accessibility; the pointer was not used"));
             }
         }
@@ -75,12 +77,14 @@ impl Session {
         match reference {
             Some(reference) => {
                 let handle = self.element(&window, reference)?;
+                let cursor = self.cursor_point(&window, handle);
                 let inserted = self
                     .ports
                     .actions
                     .insert_text(handle, text, replace)
                     .map_err(Error::System)?;
                 if inserted {
+                    self.show_cursor(cursor);
                     return Ok(format!(
                         "put the text into {reference} through accessibility; the keyboard was not used"
                     ));
@@ -130,12 +134,39 @@ impl Session {
         if !self.ports.input.scroll(window.id, point, dx, dy).map_err(Error::System)? {
             return Err(Error::Covered);
         }
+        self.ports.overlay.point_at(point);
         Ok(format!("scrolled; {} was brought to the front", window.app_name))
+    }
+
+    /// Where to show the agent's cursor for an accessibility action on an
+    /// element: its centre, if that is where the window is on screen. A window
+    /// reduced to a Stage Manager thumbnail still reports its elements at
+    /// full-size positions, which would put the cursor over some other app.
+    ///
+    /// Read before the action: afterwards the app may be busy with what the
+    /// action started, and the reply must not wait for it.
+    fn cursor_point(&self, window: &WindowInfo, handle: ElementHandle) -> Option<Point> {
+        let frame = self.ports.actions.frame(handle).ok()??;
+        let centre = Point { x: frame.x + frame.width / 2.0, y: frame.y + frame.height / 2.0 };
+        let on_screen = window.frame;
+        let inside = (on_screen.x..on_screen.x + on_screen.width).contains(&centre.x)
+            && (on_screen.y..on_screen.y + on_screen.height).contains(&centre.y);
+        inside.then_some(centre)
+    }
+
+    /// The cursor marks delivered actions only, so it is shown afterwards.
+    fn show_cursor(&self, point: Option<Point>) {
+        if let Some(point) = point {
+            self.ports.overlay.point_at(point);
+        }
     }
 
     fn real_click(&self, window: &WindowInfo, point: Point, button: Button, count: u8) -> Result<(), Error> {
         match self.ports.input.click(window.id, point, button, count).map_err(Error::System)? {
-            true => Ok(()),
+            true => {
+                self.ports.overlay.point_at(point);
+                Ok(())
+            }
             // The port re-checks before each press, so a refused double click
             // may have delivered its first click.
             false if count > 1 => Err(Error::DoubleClickCovered),
@@ -237,6 +268,35 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_cursor_is_shown_wherever_an_action_lands() {
+        let centre = Point { x: 350.0, y: 170.0 };
+        let (session, fake) = observed(Fake { accessible: true, ..Fake::default() });
+        session.click(&policy(), 1, &save(), Button::Left, false, Mode::Auto).unwrap();
+        session.type_text(&policy(), 1, Some(SAVE), "hi", false, Mode::Auto).unwrap();
+        assert_eq!(*fake.pointed.lock().unwrap(), [centre, centre]);
+
+        let (session, fake) = observed(Fake::default());
+        session.click(&policy(), 1, &save(), Button::Left, false, Mode::Auto).unwrap();
+        session.scroll(&policy(), 1, None, 0, 3).unwrap();
+        assert_eq!(*fake.pointed.lock().unwrap(), [centre, Point { x: 1100.0, y: 550.0 }]);
+
+        // An element reported outside the window's on-screen frame (the
+        // window is a thumbnail elsewhere) is acted on but not pointed at.
+        let far = Rect { x: 5000.0, y: 150.0, width: 100.0, height: 40.0 };
+        let (session, fake) =
+            observed(Fake { accessible: true, button_moved_to: Some(far), ..Fake::default() });
+        session.click(&policy(), 1, &save(), Button::Left, false, Mode::Auto).unwrap();
+        assert_eq!(fake.log(), ["ax Press 7"]);
+        assert!(fake.pointed.lock().unwrap().is_empty());
+
+        // Refused actions show nothing.
+        let (session, fake) = observed(Fake::default());
+        let _ = session.click(&policy(), 1, &save(), Button::Left, false, Mode::Background);
+        let _ = session.click(&policy(), 2, &save(), Button::Left, false, Mode::Auto);
+        assert!(fake.pointed.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn click_falls_back_to_the_real_pointer_at_the_element_centre() {
         let (session, fake) = observed(Fake::default());
         session.click(&policy(), 1, &save(), Button::Left, false, Mode::Auto).unwrap();
@@ -329,6 +389,7 @@ mod tests {
         );
         assert_eq!(session.scroll(&policy(), 1, None, 0, 3), Err(Error::Covered));
         assert!(fake.log().iter().all(|entry| entry.starts_with("activate")), "{:?}", fake.log());
+        assert!(fake.pointed.lock().unwrap().is_empty(), "nothing was delivered, so no cursor");
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! Real pointer and keyboard input via CGEvent, plus what it relies on:
 //! bringing a window to the front and asking which window is at a point.
 //!
-//! There is no AppKit run loop in this process, so NSWorkspace and
-//! NSRunningApplication state would be stale here. Everything below asks the
-//! window server or the target app directly at the moment of the call.
+//! Calls arrive on background threads, off the AppKit run loop, where
+//! NSWorkspace and NSRunningApplication state may be stale. Everything below
+//! asks the window server or the target app directly at the moment of the call.
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};

@@ -178,3 +178,12 @@ pub trait Input: Send + Sync {
     /// Presses a key combination, delivered like [`Input::type_text`].
     fn press_key(&self, pid: i32, combo: KeyCombo) -> PortResult<()>;
 }
+
+/// The agent's own cursor, drawn over the screen so the user can see where
+/// the agent is acting. It is only a picture: it never receives input and
+/// never appears in screenshots the agent gets.
+pub trait Overlay: Send + Sync {
+    /// Shows the cursor acting at a screen point. Best effort: never blocks
+    /// for long and never fails the action it accompanies.
+    fn point_at(&self, point: Point);
+}

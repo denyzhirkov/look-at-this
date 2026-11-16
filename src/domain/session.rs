@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use crate::domain::policy::{Access, AccessPolicy};
 use crate::domain::snapshot::{RefError, Snapshot, one_line};
 use crate::domain::viewport::{Viewport, clamp_to_window, is_thumbnail};
-use crate::ports::{ElementHandle, Input, Rect, ScreenCapture, UiActions, UiTree, WindowInfo, WindowSource};
+use crate::ports::{
+    ElementHandle, Input, Overlay, Rect, ScreenCapture, UiActions, UiTree, WindowInfo, WindowSource,
+};
 
 /// Upper bound on accessibility elements read per observe.
 const MAX_TREE_NODES: usize = 1500;
@@ -131,6 +133,7 @@ pub struct Ports {
     pub tree: Arc<dyn UiTree>,
     pub actions: Arc<dyn UiActions>,
     pub input: Arc<dyn Input>,
+    pub overlay: Arc<dyn Overlay>,
 }
 
 pub struct Session {

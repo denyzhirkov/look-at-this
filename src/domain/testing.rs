@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::domain::policy::AccessPolicy;
 use crate::domain::session::{Ports, Session};
 use crate::ports::{
-    Button, ElementHandle, Input, KeyCombo, Point, PortResult, Rect, ScreenCapture, UiAction,
+    Button, ElementHandle, Input, KeyCombo, Overlay, Point, PortResult, Rect, ScreenCapture, UiAction,
     UiActions, UiNode, UiTree, UiTreeSnapshot, WindowInfo, WindowSource,
 };
 
@@ -21,6 +21,8 @@ pub struct Fake {
     pub tree_reads: Mutex<u32>,
     /// Size accessibility reports for the window; `None` reports no frame.
     pub ax_window_size: Option<(f64, f64)>,
+    /// Where the agent's cursor was shown, in order.
+    pub pointed: Mutex<Vec<Point>>,
     /// Every action and real-input call, in order.
     pub log: Mutex<Vec<String>>,
     /// Whether accessibility actions and text insertion succeed.
@@ -161,6 +163,12 @@ impl Input for Fake {
     }
 }
 
+impl Overlay for Fake {
+    fn point_at(&self, point: Point) {
+        self.pointed.lock().unwrap().push(point);
+    }
+}
+
 pub fn session() -> (Session, Arc<Fake>) {
     session_with(Fake::default())
 }
@@ -173,6 +181,7 @@ pub fn session_with(fake: Fake) -> (Session, Arc<Fake>) {
         tree: fake.clone(),
         actions: fake.clone(),
         input: fake.clone(),
+        overlay: fake.clone(),
     };
     (Session::new(ports, 1), fake)
 }
