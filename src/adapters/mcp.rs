@@ -164,7 +164,12 @@ impl Server {
     fn doctor(&self) -> Result<CallToolResult, ErrorData> {
         // Re-read on every call so `look-at-this allow` applies without a restart.
         let config = config::load(&self.config_path).map_err(|e| e.to_string());
-        let report = doctor::report(self.permissions.as_ref(), &self.config_path, config);
+        let report = doctor::report(
+            self.permissions.as_ref(),
+            &self.config_path,
+            config,
+            self.session.input_paused(),
+        );
         Ok(CallToolResult::success(vec![ContentBlock::json(report)?]))
     }
 

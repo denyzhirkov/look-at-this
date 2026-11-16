@@ -187,3 +187,17 @@ pub trait Overlay: Send + Sync {
     /// for long and never fails the action it accompanies.
     fn point_at(&self, point: Point);
 }
+
+/// The user's emergency stop for everything the agent does to their apps.
+pub trait Pause: Send + Sync {
+    /// True while the user has agent input paused.
+    fn is_paused(&self) -> bool;
+}
+
+/// Asking the user, outside the agent's reach, to approve a change of access.
+pub trait Consent {
+    /// Shows the user a system dialog asking whether agents may see and
+    /// control the app with this bundle id. `Ok(false)` if they decline or
+    /// do not answer; an error if no dialog can be shown.
+    fn confirm_allow(&self, bundle_id: &str) -> PortResult<bool>;
+}

@@ -13,16 +13,18 @@ use dispatch2::DispatchQueue;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-use adapters::macos::{MacInput, MacOverlay, MacPermissions, MacScreen, MacUiTree};
+use adapters::macos::{
+    MacConsent, MacInput, MacOverlay, MacPause, MacPermissions, MacScreen, MacUiTree,
+};
 use adapters::mcp;
-use domain::policy::{Access, AccessPolicy};
+use domain::allow::{self, Outcome};
 use domain::session::{Ports, Session};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const USAGE: &str = "usage:
   look-at-this                    run the MCP server on stdio
-  look-at-this allow <bundle-id>  let agents see and control an app";
+  look-at-this allow <bundle-id>  let agents see and control an app (asks you to confirm)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,6 +52,12 @@ fn report(result: Result<()>) -> u8 {
 /// server runs on the runtime's threads and the process exits when it ends.
 fn serve() -> Result<()> {
     let mtm = MainThreadMarker::new().ok_or("the server must start on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    // No Dock icon or menu bar; never the active app, so it never takes focus.
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let config_path = config::default_path()?;
+    // No server runs without the user's emergency stop.
+    let pause = MacPause::install(mtm, config_path.with_file_name("paused")).map_err(|e| format!("cannot start: {e}"))?;
     let screen = Arc::new(MacScreen);
     // Refs start at a different thousand each run (see Session::new).
     let run = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() as u64 % 900;
@@ -62,13 +70,11 @@ fn serve() -> Result<()> {
         // Here, on the main thread, before the runtime starts (see MacInput::new).
         input: Arc::new(MacInput::new().map_err(|e| format!("cannot start: {e}"))?),
         overlay: Arc::new(MacOverlay),
+        pause: Arc::new(pause),
     };
     let session = Session::new(ports, (run + 1) * 1000);
-    let server = mcp::Server::new(Arc::new(MacPermissions), session, config::default_path()?);
+    let server = mcp::Server::new(Arc::new(MacPermissions), session, config_path);
     let runtime = tokio::runtime::Runtime::new()?;
-    let app = NSApplication::sharedApplication(mtm);
-    // No Dock icon or menu bar; never the active app, so it never takes focus.
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     thread::Builder::new().name("mcp".into()).spawn(move || {
         let result = runtime.block_on(mcp::serve(server));
         // On the main thread, where AppKit expects exit handlers to run.
@@ -79,18 +85,13 @@ fn serve() -> Result<()> {
 }
 
 fn allow(bundle_id: &str) -> Result<()> {
+    let bundle_id = bundle_id.trim();
     let path = config::default_path()?;
     let mut config = config::load(&path)?;
-    match AccessPolicy::new(&config.allowed_apps).check(bundle_id) {
-        Access::Allowed => println!("{bundle_id} is already allowed"),
-        Access::Forbidden => {
-            return Err(format!(
-                "{bundle_id} can never be controlled: it could be used to bypass agent safeguards"
-            )
-            .into());
-        }
-        Access::NotAllowed => {
-            config.allowed_apps.push(bundle_id.trim().to_string());
+    match allow::allow(&mut config, bundle_id, &MacConsent)? {
+        Outcome::AlreadyAllowed => println!("{bundle_id} is already allowed"),
+        Outcome::Declined => return Err(format!("{bundle_id} was not allowed: the confirmation dialog was declined or not answered").into()),
+        Outcome::Added => {
             config::save(&path, &config)?;
             println!("{bundle_id} allowed ({})", path.display());
         }

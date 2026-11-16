@@ -4,7 +4,9 @@ use crate::domain::keys;
 use crate::domain::policy::AccessPolicy;
 use crate::domain::session::{Error, Session};
 use crate::domain::viewport::clamp_to_window;
-use crate::ports::{Button, ElementHandle, Key, KeyCombo, Modifiers, Point, Rect, UiAction, WindowInfo};
+use crate::ports::{
+    Button, ElementHandle, Input, Key, KeyCombo, Modifiers, Point, Rect, UiAction, WindowInfo,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
@@ -23,6 +25,9 @@ pub enum At {
     Pixel { x: f64, y: f64 },
 }
 
+/// Characters typed between two checks of the emergency stop.
+const TYPING_PORTION: usize = 40;
+
 const SELECT_ALL: KeyCombo = KeyCombo {
     modifiers: Modifiers { cmd: true, ctrl: false, alt: false, shift: false },
     key: Key::Char('a'),
@@ -39,6 +44,7 @@ impl Session {
         double: bool,
         mode: Mode,
     ) -> Result<String, Error> {
+        self.ensure_running()?;
         let window = self.allowed_window(policy, window_id)?;
         if let At::Element(reference) = at
             && !double
@@ -72,8 +78,8 @@ impl Session {
         replace: bool,
         mode: Mode,
     ) -> Result<String, Error> {
+        self.ensure_running()?;
         let window = self.allowed_window(policy, window_id)?;
-        let input = &self.ports.input;
         match reference {
             Some(reference) => {
                 let handle = self.element(&window, reference)?;
@@ -97,13 +103,18 @@ impl Session {
                 if mode == Mode::Background {
                     return Err(Error::NeedsRealInput);
                 }
-                input.activate(window.pid, window.id).map_err(Error::System)?;
+                self.input()?.activate(window.pid, window.id).map_err(Error::System)?;
             }
         }
         if replace {
-            input.press_key(window.pid, SELECT_ALL).map_err(Error::System)?;
+            self.input()?.press_key(window.pid, SELECT_ALL).map_err(Error::System)?;
         }
-        input.type_text(window.pid, text).map_err(Error::System)?;
+        // In portions, so the emergency stop can cut a long text short.
+        let chars: Vec<char> = text.chars().collect();
+        for portion in chars.chunks(TYPING_PORTION) {
+            let portion: String = portion.iter().collect();
+            self.input()?.type_text(window.pid, &portion).map_err(Error::System)?;
+        }
         Ok(format!(
             "typed with real key events at the cursor; {} was brought to the front",
             window.app_name
@@ -113,10 +124,10 @@ impl Session {
     /// Presses a combination such as `cmd+s` in the window's app.
     pub fn press_key(&self, policy: &AccessPolicy, window_id: u32, keys: &str) -> Result<String, Error> {
         let combo = keys::parse(keys).map_err(Error::BadKeys)?;
+        self.ensure_running()?;
         let window = self.allowed_window(policy, window_id)?;
-        let input = &self.ports.input;
-        input.activate(window.pid, window.id).map_err(Error::System)?;
-        input.press_key(window.pid, combo).map_err(Error::System)?;
+        self.input()?.activate(window.pid, window.id).map_err(Error::System)?;
+        self.input()?.press_key(window.pid, combo).map_err(Error::System)?;
         Ok(format!("pressed {keys}; {} was brought to the front", window.app_name))
     }
 
@@ -129,13 +140,30 @@ impl Session {
         dx: i32,
         dy: i32,
     ) -> Result<String, Error> {
+        self.ensure_running()?;
         let window = self.allowed_window(policy, window_id)?;
         let point = self.real_target(&window, at, Mode::Auto)?;
-        if !self.ports.input.scroll(window.id, point, dx, dy).map_err(Error::System)? {
+        if !self.input()?.scroll(window.id, point, dx, dy).map_err(Error::System)? {
             return Err(Error::Covered);
         }
         self.ports.overlay.point_at(point);
         Ok(format!("scrolled; {} was brought to the front", window.app_name))
+    }
+
+    /// The real-input port, unless the user has hit the emergency stop. Asked
+    /// for anew before every single delivery: bringing a window forward can
+    /// take seconds, and that is exactly when a user reaches for the stop.
+    fn input(&self) -> Result<&dyn Input, Error> {
+        self.ensure_running()?;
+        Ok(self.ports.input.as_ref())
+    }
+
+    /// Refuses once the user has hit the emergency stop.
+    fn ensure_running(&self) -> Result<(), Error> {
+        match self.ports.pause.is_paused() {
+            true => Err(Error::Paused),
+            false => Ok(()),
+        }
     }
 
     /// Where to show the agent's cursor for an accessibility action on an
@@ -162,7 +190,7 @@ impl Session {
     }
 
     fn real_click(&self, window: &WindowInfo, point: Point, button: Button, count: u8) -> Result<(), Error> {
-        match self.ports.input.click(window.id, point, button, count).map_err(Error::System)? {
+        match self.input()?.click(window.id, point, button, count).map_err(Error::System)? {
             true => {
                 self.ports.overlay.point_at(point);
                 Ok(())
@@ -193,7 +221,7 @@ impl Session {
             Some(At::Element(reference)) => Some((reference, self.element(window, reference)?)),
             _ => None,
         };
-        self.ports.input.activate(window.pid, window.id).map_err(Error::System)?;
+        self.input()?.activate(window.pid, window.id).map_err(Error::System)?;
 
         // Positions are read only now: bringing an app forward can move its
         // windows (Stage Manager), and content may have scrolled since observe.
@@ -474,6 +502,36 @@ mod tests {
             ]
         );
         assert!(matches!(session.press_key(&policy(), 1, "cmd+nope"), Err(Error::BadKeys(_))));
+    }
+
+    #[test]
+    fn emergency_stop_refuses_every_action_and_cuts_typing_short() {
+        let (session, fake) = observed(Fake { accessible: true, ..Fake::default() });
+        *fake.paused.lock().unwrap() = true;
+        let p = policy();
+        assert_eq!(session.click(&p, 1, &save(), Button::Left, false, Mode::Auto), Err(Error::Paused));
+        assert_eq!(session.type_text(&p, 1, Some(SAVE), "hi", false, Mode::Auto), Err(Error::Paused));
+        assert_eq!(session.press_key(&p, 1, "enter"), Err(Error::Paused));
+        assert_eq!(session.scroll(&p, 1, None, 0, 1), Err(Error::Paused));
+        assert!(fake.log().is_empty(), "{:?}", fake.log());
+
+        // The user stops the agent while it is bringing the app forward:
+        // nothing after that may be delivered.
+        let stopped_while_activating = || observed(Fake { pause_once_activated: true, ..Fake::default() });
+        let (session, fake) = stopped_while_activating();
+        assert_eq!(session.click(&p, 1, &save(), Button::Left, false, Mode::Auto), Err(Error::Paused));
+        assert_eq!(fake.log(), ["activate pid 1 window 1"]);
+        let (session, fake) = stopped_while_activating();
+        assert_eq!(session.press_key(&p, 1, "enter"), Err(Error::Paused));
+        assert_eq!(session.scroll(&p, 1, None, 0, 1), Err(Error::Paused));
+        assert_eq!(session.type_text(&p, 1, None, "hi", true, Mode::Auto), Err(Error::Paused));
+        assert_eq!(fake.log(), ["activate pid 1 window 1"], "later actions are refused at once");
+
+        // The user stops the agent while it is typing a long text.
+        let (session, fake) = observed(Fake { pause_once_typing: true, ..Fake::default() });
+        let long = "x".repeat(100);
+        assert_eq!(session.type_text(&p, 1, None, &long, false, Mode::Auto), Err(Error::Paused));
+        assert_eq!(fake.log(), ["activate pid 1 window 1".to_string(), format!("type pid 1 {:?}", "x".repeat(40))]);
     }
 
     #[test]

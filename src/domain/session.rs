@@ -7,7 +7,7 @@ use crate::domain::policy::{Access, AccessPolicy};
 use crate::domain::snapshot::{RefError, Snapshot, one_line};
 use crate::domain::viewport::{Viewport, clamp_to_window, is_thumbnail};
 use crate::ports::{
-    ElementHandle, Input, Overlay, Rect, ScreenCapture, UiActions, UiTree, WindowInfo, WindowSource,
+    ElementHandle, Input, Overlay, Pause, Rect, ScreenCapture, UiActions, UiTree, WindowInfo, WindowSource,
 };
 
 /// Upper bound on accessibility elements read per observe.
@@ -56,6 +56,7 @@ pub enum Error {
     NoView,
     PointOutside,
     BadKeys(String),
+    Paused,
     System(String),
 }
 
@@ -121,6 +122,11 @@ impl fmt::Display for Error {
             ),
             Self::PointOutside => write!(f, "x,y are outside the window image"),
             Self::BadKeys(message) => write!(f, "{message}"),
+            Self::Paused => write!(
+                f,
+                "the user has paused agent input with the emergency stop (ctrl+option+cmd+escape). \
+                 Do not retry: tell the user, and continue only after they resume it"
+            ),
             Self::System(message) => write!(f, "{message}"),
         }
     }
@@ -134,6 +140,7 @@ pub struct Ports {
     pub actions: Arc<dyn UiActions>,
     pub input: Arc<dyn Input>,
     pub overlay: Arc<dyn Overlay>,
+    pub pause: Arc<dyn Pause>,
 }
 
 pub struct Session {
@@ -155,6 +162,11 @@ impl Session {
     pub fn new(ports: Ports, first_element_id: u64) -> Self {
         let state = State { snapshot: None, next_element_id: first_element_id, view: None };
         Self { ports, state: Mutex::new(state) }
+    }
+
+    /// Whether the user's emergency stop is on.
+    pub fn input_paused(&self) -> bool {
+        self.ports.pause.is_paused()
     }
 
     /// Windows of allowed apps only.

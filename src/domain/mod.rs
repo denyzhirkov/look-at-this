@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod allow;
 pub mod doctor;
 pub mod keys;
 pub mod policy;

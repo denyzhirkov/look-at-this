@@ -71,35 +71,8 @@ struct Cursor {
 impl Cursor {
     fn new(mtm: MainThreadMarker) -> Option<Self> {
         let bounds = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(SIZE, SIZE));
-        // SAFETY: a borderless, buffered window with a valid content rect.
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                mtm.alloc(),
-                bounds,
-                NSWindowStyleMask::Borderless,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
-        // SAFETY: the window is owned by `Cursor` and never closed.
-        unsafe { window.setReleasedWhenClosed(false) };
-        window.setOpaque(false);
-        window.setBackgroundColor(Some(&NSColor::clearColor()));
+        let window = click_through_window(mtm, bounds.size);
         window.setHasShadow(false);
-        // The window server then skips the window in hit tests: clicks go to
-        // what is underneath, and the topmost check in input.rs never sees it.
-        // A borderless window cannot become key or main.
-        window.setIgnoresMouseEvents(true);
-        // Above app windows, the Dock and menus. Not on an app window level, so
-        // the window list (screen.rs) and Stage Manager leave it alone.
-        window.setLevel(NSScreenSaverWindowLevel);
-        window.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::Stationary
-                | NSWindowCollectionBehavior::IgnoresCycle
-                | NSWindowCollectionBehavior::FullScreenAuxiliary,
-        );
-        window.setAnimationBehavior(NSWindowAnimationBehavior::None);
 
         let orange = CGColor::new_srgb(1.0, 0.42, 0.0, 1.0);
         let centre = SIZE / 2.0;
@@ -207,8 +180,43 @@ impl Cursor {
     }
 }
 
+/// A transparent window that only shows things: it never receives input,
+/// never takes focus and stays out of the window list. Its owner keeps it
+/// for the life of the process.
+pub(super) fn click_through_window(mtm: MainThreadMarker, size: CGSize) -> Retained<NSWindow> {
+    // SAFETY: a borderless, buffered window with a valid content rect.
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            mtm.alloc(),
+            CGRect::new(CGPoint::new(0.0, 0.0), size),
+            NSWindowStyleMask::Borderless,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    // SAFETY: the owner keeps the window and never closes it.
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    // The window server then skips the window in hit tests: clicks go to
+    // what is underneath, and the topmost check in input.rs never sees it.
+    // A borderless window cannot become key or main.
+    window.setIgnoresMouseEvents(true);
+    // Above app windows, the Dock and menus. Not on an app window level, so
+    // the window list (screen.rs) and Stage Manager leave it alone.
+    window.setLevel(NSScreenSaverWindowLevel);
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::IgnoresCycle
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+    window
+}
+
 /// Runs `changes` to the animator proxies as one eased animation.
-fn animate(seconds: f64, changes: impl Fn(), done: Option<&DynBlock<dyn Fn()>>) {
+pub(super) fn animate(seconds: f64, changes: impl Fn(), done: Option<&DynBlock<dyn Fn()>>) {
     let changes = RcBlock::new(move |context: NonNull<NSAnimationContext>| {
         // SAFETY: AppKit passes the current context, valid for this call.
         let context = unsafe { context.as_ref() };

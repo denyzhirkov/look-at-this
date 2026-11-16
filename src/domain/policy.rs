@@ -26,6 +26,7 @@ const FORBIDDEN_APPS: &[&str] = &[
     "com.apple.shortcuts",
     "com.apple.systempreferences",
     "com.apple.securityagent",
+    "com.apple.usernotificationcenter", // shows the dialog that approves `allow`
     "com.apple.keychainaccess",
     "com.apple.passwords",
     "com.1password.1password",

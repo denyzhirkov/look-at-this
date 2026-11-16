@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::domain::policy::AccessPolicy;
 use crate::domain::session::{Ports, Session};
 use crate::ports::{
-    Button, ElementHandle, Input, KeyCombo, Overlay, Point, PortResult, Rect, ScreenCapture, UiAction,
+    Button, ElementHandle, Input, KeyCombo, Overlay, Pause, Point, PortResult, Rect, ScreenCapture, UiAction,
     UiActions, UiNode, UiTree, UiTreeSnapshot, WindowInfo, WindowSource,
 };
 
@@ -21,6 +21,12 @@ pub struct Fake {
     pub tree_reads: Mutex<u32>,
     /// Size accessibility reports for the window; `None` reports no frame.
     pub ax_window_size: Option<(f64, f64)>,
+    /// The emergency stop.
+    pub paused: Mutex<bool>,
+    /// Whether the user hits the emergency stop while the app comes forward.
+    pub pause_once_activated: bool,
+    /// Whether the user hits the emergency stop as soon as typing starts.
+    pub pause_once_typing: bool,
     /// Where the agent's cursor was shown, in order.
     pub pointed: Mutex<Vec<Point>>,
     /// Every action and real-input call, in order.
@@ -128,6 +134,9 @@ impl UiActions for Fake {
 impl Input for Fake {
     fn activate(&self, pid: i32, window_id: u32) -> PortResult<()> {
         self.record(format!("activate pid {pid} window {window_id}"));
+        if self.pause_once_activated {
+            *self.paused.lock().unwrap() = true;
+        }
         Ok(())
     }
 
@@ -149,6 +158,9 @@ impl Input for Fake {
 
     fn type_text(&self, pid: i32, text: &str) -> PortResult<()> {
         self.record(format!("type pid {pid} {text:?}"));
+        if self.pause_once_typing {
+            *self.paused.lock().unwrap() = true;
+        }
         Ok(())
     }
 
@@ -169,6 +181,12 @@ impl Overlay for Fake {
     }
 }
 
+impl Pause for Fake {
+    fn is_paused(&self) -> bool {
+        *self.paused.lock().unwrap()
+    }
+}
+
 pub fn session() -> (Session, Arc<Fake>) {
     session_with(Fake::default())
 }
@@ -182,6 +200,7 @@ pub fn session_with(fake: Fake) -> (Session, Arc<Fake>) {
         actions: fake.clone(),
         input: fake.clone(),
         overlay: fake.clone(),
+        pause: fake.clone(),
     };
     (Session::new(ports, 1), fake)
 }

@@ -27,6 +27,11 @@ const POINTER_PAUSE: Duration = Duration::from_millis(15);
 /// what a hover shows at once (a popup window took about two frames live)
 /// to be on screen; delayed reveals such as the Dock's are not waited for.
 const HOVER_SETTLE: Duration = Duration::from_millis(60);
+/// After each typed character. Unpaced, keys were posted at about 17,000 a
+/// second while the test app consumed 300 to 600, so thousands queued up and
+/// kept arriving for 30 s after the emergency stop. At about 200 a second
+/// the app keeps up, and a stop between the domain's portions takes effect at once.
+const KEY_PACE: Duration = Duration::from_millis(5);
 const EVENT_FAILED: &str = "CoreGraphics could not create an input event; nothing was sent; try again";
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -157,6 +162,7 @@ impl Input for MacInput {
                 // matter and the user's keyboard layout cannot change it.
                 post_key(pid, 0, CGEventFlags::empty(), Some(c))?;
             }
+            sleep(KEY_PACE);
         }
         Ok(())
     }

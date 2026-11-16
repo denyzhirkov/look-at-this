@@ -14,6 +14,8 @@ pub struct DoctorReport {
     pub accessibility: bool,
     pub config_path: String,
     pub allowed_apps: Vec<String>,
+    /// True while the user's emergency stop blocks all agent input.
+    pub input_paused: bool,
     /// What the user has to fix, in plain words. Empty when ready.
     pub problems: Vec<String>,
 }
@@ -22,6 +24,7 @@ pub fn report(
     permissions: &dyn Permissions,
     config_path: &Path,
     config: Result<Config, String>,
+    input_paused: bool,
 ) -> DoctorReport {
     let screen_recording = permissions.screen_recording();
     let accessibility = permissions.accessibility();
@@ -32,6 +35,14 @@ pub fn report(
     }
     if !accessibility {
         problems.push(permission_problem("Accessibility"));
+    }
+
+    if input_paused {
+        problems.push(
+            "The user has paused agent input with the emergency stop (ctrl+option+cmd+escape). \
+             Clicks and typing are refused until the user presses it again."
+                .to_string(),
+        );
     }
 
     let mut allowed_apps = Vec::new();
@@ -61,6 +72,7 @@ pub fn report(
         accessibility,
         config_path: config_path.display().to_string(),
         allowed_apps,
+        input_paused,
         problems,
     }
 }
@@ -100,7 +112,7 @@ mod tests {
     #[test]
     fn ready_setup_has_no_problems() {
         let perms = Fake { screen_recording: true, accessibility: true };
-        let r = report(&perms, Path::new("/c.toml"), config(&["com.apple.TextEdit"]));
+        let r = report(&perms, Path::new("/c.toml"), config(&["com.apple.TextEdit"]), false);
         assert!(r.problems.is_empty(), "{:?}", r.problems);
         assert_eq!(r.allowed_apps, ["com.apple.TextEdit"]);
     }
@@ -108,7 +120,7 @@ mod tests {
     #[test]
     fn every_gap_is_reported() {
         let perms = Fake { screen_recording: false, accessibility: false };
-        let r = report(&perms, Path::new("/c.toml"), config(&["com.apple.Terminal"]));
+        let r = report(&perms, Path::new("/c.toml"), config(&["com.apple.Terminal"]), false);
         // Two permissions, one forbidden entry, and nothing usable left.
         assert_eq!(r.problems.len(), 4, "{:?}", r.problems);
         assert!(r.allowed_apps.is_empty());
@@ -117,8 +129,10 @@ mod tests {
     #[test]
     fn broken_config_is_a_problem_not_a_crash() {
         let perms = Fake { screen_recording: true, accessibility: true };
-        let r = report(&perms, Path::new("/c.toml"), Err("bad toml".to_string()));
-        assert_eq!(r.problems.len(), 1);
-        assert!(r.problems[0].contains("bad toml"));
+        let r = report(&perms, Path::new("/c.toml"), Err("bad toml".to_string()), true);
+        // The unreadable config and the emergency stop.
+        assert_eq!(r.problems.len(), 2);
+        assert!(r.input_paused);
+        assert!(r.problems.iter().any(|p| p.contains("bad toml")));
     }
 }
