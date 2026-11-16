@@ -8,10 +8,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use adapters::macos::{MacPermissions, MacScreen, MacUiTree};
+use adapters::macos::{MacInput, MacPermissions, MacScreen, MacUiTree};
 use adapters::mcp;
 use domain::policy::{Access, AccessPolicy};
-use domain::session::Session;
+use domain::session::{Ports, Session};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -40,7 +40,16 @@ fn serve() -> Result<()> {
     let screen = Arc::new(MacScreen);
     // Refs start at a different thousand each run (see Session::new).
     let run = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() as u64 % 900;
-    let session = Session::new(screen.clone(), screen, Arc::new(MacUiTree), (run + 1) * 1000);
+    let ui = Arc::new(MacUiTree::default());
+    let ports = Ports {
+        windows: screen.clone(),
+        capture: screen,
+        tree: ui.clone(),
+        actions: ui,
+        // Here, on the main thread, before the runtime starts (see MacInput::new).
+        input: Arc::new(MacInput::new().map_err(|e| format!("cannot start: {e}"))?),
+    };
+    let session = Session::new(ports, (run + 1) * 1000);
     let server = mcp::Server::new(Arc::new(MacPermissions), session, config::default_path()?);
     tokio::runtime::Runtime::new()?.block_on(mcp::serve(server))
 }

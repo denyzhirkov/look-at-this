@@ -25,6 +25,14 @@ impl Viewport {
         (px(self.region.width), px(self.region.height))
     }
 
+    /// Converts an image pixel to a window-relative point, if it is inside
+    /// the image.
+    pub fn window_point(self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (width, height) = self.image_size();
+        let inside = (0.0..f64::from(width)).contains(&x) && (0.0..f64::from(height)).contains(&y);
+        inside.then(|| (self.region.x + x / self.scale, self.region.y + y / self.scale))
+    }
+
     /// Converts a window-relative rectangle to image pixels.
     pub fn to_image(self, rect: Rect) -> Rect {
         Rect {
@@ -68,6 +76,14 @@ mod tests {
         assert_eq!(v.scale, 0.5);
         assert_eq!(v.image_size(), (1000, 500));
         assert_eq!(v.to_image(rect(200.0, 100.0, 40.0, 20.0)), rect(100.0, 50.0, 20.0, 10.0));
+    }
+
+    #[test]
+    fn image_pixel_maps_back_to_the_window() {
+        let v = Viewport::fit(rect(0.0, 0.0, 2000.0, 1000.0), 1.0, 1000);
+        assert_eq!(v.window_point(100.0, 50.0), Some((200.0, 100.0)));
+        assert_eq!(v.window_point(1000.0, 50.0), None, "one past the right edge");
+        assert_eq!(v.window_point(-1.0, 50.0), None);
     }
 
     #[test]

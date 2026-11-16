@@ -22,6 +22,11 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// Smaller windows are invisible helpers (e.g. 1x1 px utility windows).
 const MIN_WINDOW_EDGE: f64 = 20.0;
 
+/// Window levels an app's own windows live on: normal (0), floating panels
+/// (3) and modal dialogs such as alerts (8). Menus, the Dock and other system
+/// layers are above these.
+const APP_WINDOW_LAYERS: [isize; 3] = [0, 3, 8];
+
 pub struct MacScreen;
 
 impl WindowSource for MacScreen {
@@ -142,7 +147,7 @@ fn window_info(window: &SCWindow) -> Option<WindowInfo> {
     // SCWindow.frame is in global display points, origin at the top-left of
     // the main display: the same space as WindowInfo.frame.
     let frame = unsafe { window.frame() };
-    let ordinary = unsafe { window.windowLayer() == 0 && window.isOnScreen() };
+    let ordinary = unsafe { APP_WINDOW_LAYERS.contains(&window.windowLayer()) && window.isOnScreen() };
     if !ordinary || frame.size.width < MIN_WINDOW_EDGE || frame.size.height < MIN_WINDOW_EDGE {
         return None;
     }

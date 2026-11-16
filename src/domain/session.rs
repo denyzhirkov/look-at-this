@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::domain::policy::{Access, AccessPolicy};
 use crate::domain::snapshot::{RefError, Snapshot, one_line};
 use crate::domain::viewport::{Viewport, clamp_to_window, is_thumbnail};
-use crate::ports::{Rect, ScreenCapture, UiTree, WindowInfo, WindowSource};
+use crate::ports::{ElementHandle, Input, Rect, ScreenCapture, UiActions, UiTree, WindowInfo, WindowSource};
 
 /// Upper bound on accessibility elements read per observe.
 const MAX_TREE_NODES: usize = 1500;
@@ -46,7 +46,14 @@ pub enum Error {
     StaleRef(String),
     BadRef(String),
     RefNotVisible(String),
+    Obscured(String),
     Thumbnail,
+    NeedsRealInput,
+    Covered,
+    DoubleClickCovered,
+    NoView,
+    PointOutside,
+    BadKeys(String),
     System(String),
 }
 
@@ -73,46 +80,83 @@ impl fmt::Display for Error {
                 "{r} is not from the latest observe of this window; call observe again"
             ),
             Self::BadRef(r) => write!(f, "{r} is not an element ref; refs look like e12"),
-            Self::RefNotVisible(r) => write!(f, "{r} has no visible area inside the window"),
+            Self::RefNotVisible(r) => write!(
+                f,
+                "{r} has no visible area inside the window; scroll it into view and observe again"
+            ),
             Self::Thumbnail => write!(
                 f,
                 "this window is only a Stage Manager thumbnail because its app is in the \
                  background, so it cannot be observed. Ask the user to bring the app to the \
                  front or to turn Stage Manager off"
             ),
+            Self::NeedsRealInput => write!(
+                f,
+                "this cannot be done through accessibility alone. Retry with mode \"auto\" to \
+                 allow real pointer and keyboard input; the app is then brought to the front"
+            ),
+            Self::Obscured(r) => write!(
+                f,
+                "{r} is not what is shown at its position right now: it is scrolled out of view \
+                 or something in the window covers it. Scroll it into view and observe again, \
+                 or use x,y from a fresh screenshot"
+            ),
+            Self::Covered => write!(
+                f,
+                "another window, a menu or a system overlay covers that point, so real input \
+                 would hit the wrong target. If it is a menu or popover of this app, press_key \
+                 escape closes it; otherwise ask the user to uncover the window"
+            ),
+            Self::DoubleClickCovered => write!(
+                f,
+                "the double click was stopped because something came to cover that point. Its \
+                 first click may already have landed: observe before trying again"
+            ),
+            Self::NoView => write!(
+                f,
+                "x,y are pixels of the window screenshot, so they need a prior observe of this \
+                 window; call observe first, or pass `ref`"
+            ),
+            Self::PointOutside => write!(f, "x,y are outside the window image"),
+            Self::BadKeys(message) => write!(f, "{message}"),
             Self::System(message) => write!(f, "{message}"),
         }
     }
 }
 
-pub struct Session {
-    windows: Arc<dyn WindowSource>,
-    capture: Arc<dyn ScreenCapture>,
-    tree: Arc<dyn UiTree>,
-    state: Mutex<State>,
+/// Everything the session needs from the operating system.
+pub struct Ports {
+    pub windows: Arc<dyn WindowSource>,
+    pub capture: Arc<dyn ScreenCapture>,
+    pub tree: Arc<dyn UiTree>,
+    pub actions: Arc<dyn UiActions>,
+    pub input: Arc<dyn Input>,
 }
 
-struct State {
+pub struct Session {
+    pub(super) ports: Ports,
+    pub(super) state: Mutex<State>,
+}
+
+pub(super) struct State {
     snapshot: Option<Snapshot>,
     next_element_id: u64,
+    /// The window and scale of the latest whole-window observe: the pixel
+    /// space in which the agent gives x,y.
+    pub(super) view: Option<(u32, Viewport)>,
 }
 
 impl Session {
     /// `first_element_id` should differ between server runs, so that a ref an
     /// agent kept from a previous run is unlikely to name a new element.
-    pub fn new(
-        windows: Arc<dyn WindowSource>,
-        capture: Arc<dyn ScreenCapture>,
-        tree: Arc<dyn UiTree>,
-        first_element_id: u64,
-    ) -> Self {
-        let state = Mutex::new(State { snapshot: None, next_element_id: first_element_id });
-        Self { windows, capture, tree, state }
+    pub fn new(ports: Ports, first_element_id: u64) -> Self {
+        let state = State { snapshot: None, next_element_id: first_element_id, view: None };
+        Self { ports, state: Mutex::new(state) }
     }
 
     /// Windows of allowed apps only.
     pub fn list_windows(&self, policy: &AccessPolicy) -> Result<Vec<WindowInfo>, Error> {
-        let mut windows = self.windows.windows().map_err(Error::System)?;
+        let mut windows = self.ports.windows.windows().map_err(Error::System)?;
         windows.retain(|w| access(policy, w) == Access::Allowed);
         Ok(windows)
     }
@@ -138,6 +182,7 @@ impl Session {
 
         if request.tree {
             let tree = self
+                .ports
                 .tree
                 .tree(window.pid, window.id, MAX_TREE_NODES)
                 .map_err(Error::System)?;
@@ -146,7 +191,7 @@ impl Session {
             }
             let mut state = self.state.lock().unwrap();
             let origin = (window.frame.x, window.frame.y);
-            let snapshot = Snapshot::build(window.id, origin, tree.root, state.next_element_id);
+            let snapshot = Snapshot::build(window.id, window.pid, origin, tree.root, state.next_element_id);
             state.next_element_id += snapshot.elements.len() as u64;
             text.push_str(&snapshot.render(&viewport));
             if tree.truncated {
@@ -157,35 +202,30 @@ impl Session {
 
         let png = match request.screenshot {
             Shot::Window => Some(
-                self.capture
+                self.ports
+                    .capture
                     .capture(window.id, window.pid, whole, width, height)
                     .map_err(Error::System)?,
             ),
             _ => None,
         };
+        // Only a successful observe defines the pixel space for x,y.
+        self.state.lock().unwrap().view = Some((window.id, viewport));
         Ok(Observation { text, png })
     }
 
     /// A magnified screenshot of one element. Leaves the snapshot untouched.
     fn zoom(&self, window: &WindowInfo, request: &ObserveRequest) -> Result<Observation, Error> {
         let reference = request.reference.as_deref().ok_or(Error::RefRequired)?;
-        let frame = {
-            let state = self.state.lock().unwrap();
-            let snapshot = state
-                .snapshot
-                .as_ref()
-                .ok_or_else(|| Error::StaleRef(reference.to_string()))?;
-            snapshot.frame_of(window.id, reference).map_err(|e| match e {
-                RefError::Malformed => Error::BadRef(reference.to_string()),
-                RefError::Stale => Error::StaleRef(reference.to_string()),
-                RefError::NoFrame => Error::RefNotVisible(reference.to_string()),
-            })?
-        };
-        let region = clamp_to_window(frame, window.frame.width, window.frame.height)
+        // Where the element is now, not where it was when observed.
+        let frame = self.live_frame(window, reference)?;
+        let relative = Rect { x: frame.x - window.frame.x, y: frame.y - window.frame.y, ..frame };
+        let region = clamp_to_window(relative, window.frame.width, window.frame.height)
             .ok_or_else(|| Error::RefNotVisible(reference.to_string()))?;
         let viewport = Viewport::fit(region, ZOOM_MAX_SCALE, request.max_edge);
         let (width, height) = viewport.image_size();
         let png = self
+            .ports
             .capture
             .capture(window.id, window.pid, region, width, height)
             .map_err(Error::System)?;
@@ -198,8 +238,31 @@ impl Session {
         })
     }
 
-    fn allowed_window(&self, policy: &AccessPolicy, window_id: u32) -> Result<WindowInfo, Error> {
+    /// The live element behind a ref of the latest observe of this window.
+    pub(super) fn element(&self, window: &WindowInfo, reference: &str) -> Result<ElementHandle, Error> {
+        let state = self.state.lock().unwrap();
+        let stale = || Error::StaleRef(reference.to_string());
+        let snapshot = state.snapshot.as_ref().ok_or_else(stale)?;
+        match snapshot.resolve(window.id, window.pid, reference) {
+            Ok(element) => Ok(element.handle),
+            Err(RefError::Malformed) => Err(Error::BadRef(reference.to_string())),
+            Err(RefError::Stale) => Err(stale()),
+        }
+    }
+
+    /// The element's current frame in screen points.
+    pub(super) fn live_frame(&self, window: &WindowInfo, reference: &str) -> Result<Rect, Error> {
+        let handle = self.element(window, reference)?;
+        self.ports
+            .actions
+            .frame(handle)
+            .map_err(Error::System)?
+            .ok_or_else(|| Error::RefNotVisible(reference.to_string()))
+    }
+
+    pub(super) fn allowed_window(&self, policy: &AccessPolicy, window_id: u32) -> Result<WindowInfo, Error> {
         let window = self
+            .ports
             .windows
             .windows()
             .map_err(Error::System)?
@@ -225,84 +288,7 @@ fn access(policy: &AccessPolicy, window: &WindowInfo) -> Access {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::{PortResult, UiNode, UiTreeSnapshot};
-
-    /// Records every capture so tests can assert what was (not) captured.
-    #[derive(Default)]
-    struct Fake {
-        captures: Mutex<Vec<(u32, Rect, u32, u32)>>,
-        tree_reads: Mutex<u32>,
-        /// Size accessibility reports for the window; `None` reports no frame.
-        ax_window_size: Option<(f64, f64)>,
-    }
-
-    impl WindowSource for Fake {
-        fn windows(&self) -> PortResult<Vec<WindowInfo>> {
-            let window = |id, bundle: &str, x| WindowInfo {
-                id,
-                pid: id as i32,
-                bundle_id: Some(bundle.to_string()),
-                app_name: bundle.to_string(),
-                title: "t".to_string(),
-                frame: Rect { x, y: 50.0, width: 2000.0, height: 1000.0 },
-            };
-            let mut anonymous = window(4, "", 0.0);
-            anonymous.bundle_id = None;
-            anonymous.app_name = "helper".to_string();
-            Ok(vec![
-                window(1, "com.apple.TextEdit", 100.0),
-                window(2, "com.apple.Notes", 0.0),
-                window(3, "com.apple.Terminal", 0.0),
-                anonymous,
-            ])
-        }
-    }
-
-    impl ScreenCapture for Fake {
-        fn capture(&self, id: u32, pid: i32, region: Rect, w: u32, h: u32) -> PortResult<Vec<u8>> {
-            assert_eq!(pid, id as i32, "capture must name the process that was access-checked");
-            self.captures.lock().unwrap().push((id, region, w, h));
-            Ok(vec![1, 2, 3])
-        }
-    }
-
-    impl UiTree for Fake {
-        fn tree(&self, _pid: i32, _window_id: u32, _max: usize) -> PortResult<UiTreeSnapshot> {
-            *self.tree_reads.lock().unwrap() += 1;
-            let button = UiNode {
-                role: "AXButton".to_string(),
-                title: "Save".to_string(),
-                // Screen coordinates: 200 pt right and 100 pt below the window origin.
-                frame: Some(Rect { x: 300.0, y: 150.0, width: 100.0, height: 40.0 }),
-                enabled: true,
-                ..UiNode::default()
-            };
-            let root = UiNode {
-                role: "AXWindow".to_string(),
-                frame: self
-                    .ax_window_size
-                    .map(|(width, height)| Rect { x: 100.0, y: 50.0, width, height }),
-                enabled: true,
-                children: vec![button],
-                ..UiNode::default()
-            };
-            Ok(UiTreeSnapshot { root, truncated: false })
-        }
-    }
-
-    fn session() -> (Session, Arc<Fake>) {
-        session_with(Fake::default())
-    }
-
-    fn session_with(fake: Fake) -> (Session, Arc<Fake>) {
-        let fake = Arc::new(fake);
-        (Session::new(fake.clone(), fake.clone(), fake.clone(), 1), fake)
-    }
-
-    /// Terminal is allowlisted on purpose: the hard denylist must still win.
-    fn policy() -> AccessPolicy {
-        AccessPolicy::new(&["com.apple.TextEdit".to_string(), "com.apple.Terminal".to_string()])
-    }
+    use crate::domain::testing::{Fake, policy, session, session_with};
 
     fn request(window_id: u32, screenshot: Shot, reference: Option<&str>) -> ObserveRequest {
         ObserveRequest {

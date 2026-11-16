@@ -14,6 +14,13 @@ pub struct Rect {
     pub height: f64,
 }
 
+/// A position in screen points, same space as [`WindowInfo::frame`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
 /// System permissions this process currently holds.
 pub trait Permissions: Send + Sync {
     fn screen_recording(&self) -> bool;
@@ -47,9 +54,15 @@ pub trait ScreenCapture: Send + Sync {
     fn capture(&self, window_id: u32, pid: i32, region: Rect, width: u32, height: u32) -> PortResult<Vec<u8>>;
 }
 
+/// Identifies a live element of the most recent [`UiTree::tree`] call.
+/// Handles of earlier calls are rejected, never resolved to another element.
+pub type ElementHandle = u64;
+
 /// One accessibility element. Strings are empty when the attribute is absent.
 #[derive(Clone, Debug, Default)]
 pub struct UiNode {
+    /// Names this element in [`UiActions`] calls.
+    pub handle: ElementHandle,
     /// Platform role, e.g. `AXButton`.
     pub role: String,
     pub title: String,
@@ -72,4 +85,96 @@ pub struct UiTreeSnapshot {
 pub trait UiTree: Send + Sync {
     /// Accessibility tree of one window, reading at most `max_nodes` elements.
     fn tree(&self, pid: i32, window_id: u32, max_nodes: usize) -> PortResult<UiTreeSnapshot>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UiAction {
+    /// What a click on the element does.
+    Press,
+    /// What a right-click does: open its context menu.
+    ShowMenu,
+}
+
+/// Acting on elements through accessibility: no pointer, no focus change.
+pub trait UiActions: Send + Sync {
+    /// Whether an accessibility hit test at `point` finds this element or
+    /// something inside it, i.e. the element is really what is shown there.
+    fn is_at(&self, element: ElementHandle, point: Point) -> PortResult<bool>;
+    /// The part of the element that is visible now: its current frame cut
+    /// down to the scroll areas that enclose it. `None` if it has no frame or
+    /// is entirely scrolled out of view.
+    fn frame(&self, element: ElementHandle) -> PortResult<Option<Rect>>;
+    /// `Ok(false)` if the element does not offer this action.
+    fn perform(&self, element: ElementHandle, action: UiAction) -> PortResult<bool>;
+    /// Inserts `text` at the element's insertion point, or replaces its whole
+    /// content. `Ok(false)` if the element does not accept text this way.
+    fn insert_text(&self, element: ElementHandle, text: &str, replace: bool) -> PortResult<bool>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Button {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Key {
+    /// A printable key, lower case, e.g. `s` or `/`.
+    Char(char),
+    Enter,
+    Tab,
+    Escape,
+    Space,
+    Backspace,
+    Delete,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    /// F1 to F12.
+    F(u8),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Modifiers {
+    pub cmd: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeyCombo {
+    pub modifiers: Modifiers,
+    pub key: Key,
+}
+
+/// Real input, as a person would produce it.
+pub trait Input: Send + Sync {
+    /// Brings the app, and that window of it, to the front. Returns once it
+    /// is frontmost (at once if it already is); fails if it does not get there.
+    fn activate(&self, pid: i32, window_id: u32) -> PortResult<()>;
+    /// Clicks at `point` with the real pointer, then puts the pointer back.
+    ///
+    /// Returns `Ok(false)` and stops clicking unless `window_id` is the topmost
+    /// window at that point, counting every app and system layer (menus,
+    /// Dock, banners, overlays). That is checked before the pointer moves and
+    /// again right before each button press, since moving the pointer can
+    /// itself reveal something (Dock, menu bar, hover popovers). For a double
+    /// click refused at its second press, the first click has already landed
+    /// on the window.
+    fn click(&self, window_id: u32, point: Point, button: Button, count: u8) -> PortResult<bool>;
+    /// Scrolls at `point` by lines (positive `dy` reveals content further
+    /// down, positive `dx` further right), then puts the pointer back.
+    /// Same topmost-window rule and `Ok(false)` as [`Input::click`].
+    fn scroll(&self, window_id: u32, point: Point, dx: i32, dy: i32) -> PortResult<bool>;
+    /// Types text into the focused element of process `pid`. The keys go to
+    /// that process only, never to another app or to system-wide shortcuts.
+    fn type_text(&self, pid: i32, text: &str) -> PortResult<()>;
+    /// Presses a key combination, delivered like [`Input::type_text`].
+    fn press_key(&self, pid: i32, combo: KeyCombo) -> PortResult<()>;
 }

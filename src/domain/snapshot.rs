@@ -3,7 +3,7 @@
 use std::fmt::Write;
 
 use crate::domain::viewport::Viewport;
-use crate::ports::{Rect, UiNode};
+use crate::ports::{ElementHandle, Rect, UiNode};
 
 const MAX_TEXT_CHARS: usize = 80;
 /// Deeper elements are drawn at this depth, so output grows linearly.
@@ -14,6 +14,7 @@ pub struct Element {
     /// Shown to the agent as `e<id>`. Never reused across snapshots, so a ref
     /// from an older observe cannot silently resolve to a different element.
     pub id: u64,
+    pub handle: ElementHandle,
     pub depth: usize,
     pub role: String,
     pub label: String,
@@ -27,6 +28,8 @@ pub struct Element {
 #[derive(Debug)]
 pub struct Snapshot {
     pub window_id: u32,
+    /// The process the elements belong to: window ids can be reused.
+    pub pid: i32,
     pub elements: Vec<Element>,
 }
 
@@ -35,32 +38,29 @@ pub enum RefError {
     Malformed,
     /// Not part of the latest observe of this window.
     Stale,
-    NoFrame,
 }
 
 impl Snapshot {
     /// Flattens the tree, numbering elements from `first_id`. Unlabelled
     /// containers are dropped and their children take their place.
-    pub fn build(window_id: u32, window_origin: (f64, f64), root: UiNode, first_id: u64) -> Self {
+    pub fn build(window_id: u32, pid: i32, window_origin: (f64, f64), root: UiNode, first_id: u64) -> Self {
         let mut elements = Vec::new();
         flatten(root, 0, window_origin, first_id, &mut elements);
-        Self { window_id, elements }
+        Self { window_id, pid, elements }
     }
 
-    pub fn frame_of(&self, window_id: u32, reference: &str) -> Result<Rect, RefError> {
+    pub fn resolve(&self, window_id: u32, pid: i32, reference: &str) -> Result<&Element, RefError> {
         let id: u64 = reference
             .strip_prefix('e')
             .and_then(|n| n.parse().ok())
             .ok_or(RefError::Malformed)?;
-        if window_id != self.window_id {
+        if (window_id, pid) != (self.window_id, self.pid) {
             return Err(RefError::Stale);
         }
         let first = self.elements.first().map_or(0, |e| e.id);
-        let element = id
-            .checked_sub(first)
+        id.checked_sub(first)
             .and_then(|index| self.elements.get(index as usize))
-            .ok_or(RefError::Stale)?;
-        element.frame.ok_or(RefError::NoFrame)
+            .ok_or(RefError::Stale)
     }
 
     /// One line per element: `e7 button "Save" [10,20 80x24] disabled`.
@@ -109,6 +109,7 @@ fn flatten(node: UiNode, depth: usize, origin: (f64, f64), first_id: u64, out: &
     } else {
         out.push(Element {
             id: first_id + out.len() as u64,
+            handle: node.handle,
             depth,
             role: one_line(node.role.strip_prefix("AX").unwrap_or(&node.role)).to_lowercase(),
             label: one_line(label),
@@ -155,6 +156,7 @@ mod tests {
 
     fn sample() -> UiNode {
         let mut save = node("AXButton", "Save", vec![]);
+        save.handle = 42;
         save.frame = Some(Rect { x: 110.0, y: 220.0, width: 80.0, height: 24.0 });
         save.enabled = false;
         let mut field = node("AXTextArea", "", vec![]);
@@ -165,7 +167,7 @@ mod tests {
 
     #[test]
     fn unlabelled_groups_are_dropped_and_children_hoisted() {
-        let s = Snapshot::build(1, (100.0, 200.0), sample(), 5);
+        let s = Snapshot::build(1, 9, (100.0, 200.0), sample(), 5);
         let viewport = Viewport::fit(Rect { x: 0.0, y: 0.0, width: 400.0, height: 300.0 }, 1.0, 1280);
         assert_eq!(
             s.render(&viewport),
@@ -177,23 +179,21 @@ mod tests {
 
     #[test]
     fn refs_resolve_only_within_their_snapshot() {
-        let s = Snapshot::build(1, (100.0, 200.0), sample(), 5);
-        assert_eq!(
-            s.frame_of(1, "e6"),
-            Ok(Rect { x: 10.0, y: 20.0, width: 80.0, height: 24.0 })
-        );
-        assert_eq!(s.frame_of(1, "e4"), Err(RefError::Stale), "older than this snapshot");
-        assert_eq!(s.frame_of(1, "e8"), Err(RefError::Stale), "not issued yet");
-        assert_eq!(s.frame_of(2, "e6"), Err(RefError::Stale), "another window");
-        assert_eq!(s.frame_of(1, "e7"), Err(RefError::NoFrame));
-        assert_eq!(s.frame_of(1, "save"), Err(RefError::Malformed));
+        let s = Snapshot::build(1, 9, (100.0, 200.0), sample(), 5);
+        let handle = |window, reference| s.resolve(window, 9, reference).map(|e| e.handle);
+        assert_eq!(handle(1, "e6"), Ok(42));
+        assert_eq!(s.resolve(1, 8, "e6").map(|e| e.handle), Err(RefError::Stale), "another process");
+        assert_eq!(handle(1, "e4"), Err(RefError::Stale), "older than this snapshot");
+        assert_eq!(handle(1, "e8"), Err(RefError::Stale), "not issued yet");
+        assert_eq!(handle(2, "e6"), Err(RefError::Stale), "another window");
+        assert_eq!(handle(1, "save"), Err(RefError::Malformed));
     }
 
     #[test]
     fn long_text_is_truncated() {
         let mut n = node("AXStaticText", "", vec![]);
         n.value = "x".repeat(200);
-        let s = Snapshot::build(1, (0.0, 0.0), n, 1);
+        let s = Snapshot::build(1, 9, (0.0, 0.0), n, 1);
         assert_eq!(s.elements[0].value.chars().count(), MAX_TEXT_CHARS + 1);
     }
 }
