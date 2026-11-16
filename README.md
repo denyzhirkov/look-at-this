@@ -24,7 +24,7 @@ has just built.
 ## Requirements
 
 - macOS 14 or later (developed and tested on macOS 26, Apple silicon).
-- Rust 1.85 or later to build.
+- Rust 1.88 or later to build.
 
 ## Install
 
