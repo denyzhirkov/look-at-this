@@ -4,24 +4,29 @@ use std::error::Error;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::service::RequestContext;
 use rmcp::transport::stdio;
-use rmcp::{ErrorData, ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
 use crate::config;
 use crate::domain::doctor;
 use crate::domain::policy::AccessPolicy;
 use crate::domain::actions::{At, Mode};
-use crate::domain::session::{ObserveRequest, Session, Shot};
-use crate::domain::snapshot::one_line;
+use crate::domain::session::{ListedWindow, ObserveRequest, Session, Shot, WaitRequest};
+use crate::domain::snapshot::{Filter, one_line};
 use crate::ports::{Button, Permissions};
 
 const DEFAULT_MAX_EDGE: u32 = 1280;
+const DEFAULT_WAIT_MS: u64 = 5000;
+const MAX_WAIT_MS: u64 = 30_000;
+const WAIT_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct Server {
@@ -54,6 +59,29 @@ struct ObserveParams {
     /// Longest side of the image in pixels (default 1280). Larger windows are
     /// scaled down, and tree coordinates are scaled with them.
     max_edge: Option<u32>,
+    /// Print only elements whose label or value contains this text, ignoring case.
+    find: Option<String>,
+    /// Print only elements of this role, e.g. "button", "textfield", "textarea".
+    role: Option<String>,
+    /// Print only controls that can be acted on: buttons, checkboxes, text
+    /// fields, pop-ups, sliders, links, menu items and the like (default false).
+    interactive: Option<bool>,
+    /// Do not print elements nested deeper than this; 0 is the window alone.
+    max_depth: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WaitForParams {
+    /// Window id from list_windows.
+    window_id: u32,
+    /// Text to wait for in an element's label or value, ignoring case.
+    find: Option<String>,
+    /// Role to wait for, e.g. "button" or "sheet". With find, both must match.
+    role: Option<String>,
+    /// Wait until no element matches instead (default false).
+    gone: Option<bool>,
+    /// How long to wait in milliseconds (default 5000, at most 30000).
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -134,6 +162,12 @@ struct ScrollParams {
     dx: Option<i32>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ActivateParams {
+    /// Window id from list_windows.
+    window_id: u32,
+}
+
 /// `ref`, or `x` with `y`, or neither.
 fn target(reference: Option<String>, x: Option<f64>, y: Option<f64>) -> Result<Option<At>, String> {
     match (reference, x, y) {
@@ -173,7 +207,15 @@ impl Server {
         Ok(CallToolResult::success(vec![ContentBlock::json(report)?]))
     }
 
-    #[tool(description = "List the open windows of allowed apps, with the ids that observe takes.")]
+    #[tool(
+        description = "List the open windows of allowed apps, with the ids the other tools take. \
+                       Each line is `id app (bundle) \"title\" WxH`, followed by state words when \
+                       they apply: `frontmost` (its app is the front app), `thumbnail` (only a \
+                       Stage Manager thumbnail is shown, because its app is in the background), \
+                       `off-screen` (minimised, its app hidden, or on another Space). A thumbnail \
+                       or off-screen window must be brought forward with activate before observe \
+                       or any action works on it."
+    )]
     fn list_windows(&self) -> CallToolResult {
         let windows = match self.policy().and_then(|p| self.session.list_windows(&p).map_err(|e| e.to_string())) {
             Ok(windows) => windows,
@@ -182,27 +224,27 @@ impl Server {
         if windows.is_empty() {
             return text("No windows of allowed apps are open. Call doctor to see which apps are allowed.");
         }
-        let mut out = String::new();
-        for w in windows {
-            let _ = writeln!(
-                out,
-                "{} {} ({}) \"{}\" {}x{}",
-                w.id,
-                one_line(&w.app_name),
-                w.bundle_id.unwrap_or_default(),
-                one_line(&w.title),
-                w.frame.width.round(),
-                w.frame.height.round()
-            );
-        }
-        text(out)
+        text(windows.iter().map(window_line).collect::<String>())
+    }
+
+    #[tool(
+        description = "Bring a window and its app to the front, as a person would: un-minimises \
+                       it and turns a Stage Manager thumbnail into the full window. Needed before \
+                       observe or any action on a window that list_windows marks `thumbnail` or \
+                       `off-screen`. It interrupts what the user sees, so use it only for that."
+    )]
+    fn activate(&self, Parameters(p): Parameters<ActivateParams>) -> CallToolResult {
+        self.act(|session, policy| session.activate(policy, p.window_id))
     }
 
     #[tool(
         description = "Look at a window: its element tree and/or a screenshot. Each tree line is \
                        `e<N> role \"label\" =\"value\" [x,y WxH]`; coordinates are pixels of the \
                        window screenshot. Refs (e<N>) are valid until the next observe that \
-                       returns a tree."
+                       returns a tree or the next wait_for, whatever its outcome. To keep the tree short, print only part of it with `find` \
+                       (text in label or value), `role`, `interactive` (controls only) and \
+                       `max_depth`; matches are listed without their parents, and refs of hidden \
+                       elements still work."
     )]
     fn observe(&self, Parameters(params): Parameters<ObserveParams>) -> CallToolResult {
         let request = ObserveRequest {
@@ -215,6 +257,7 @@ impl Server {
             tree: params.tree.unwrap_or(true),
             reference: params.reference,
             max_edge: params.max_edge.unwrap_or(DEFAULT_MAX_EDGE).max(1),
+            filter: Filter::new(params.find, params.role, params.interactive.unwrap_or(false), params.max_depth),
         };
         let observation = match self.policy().and_then(|p| self.session.observe(&p, request).map_err(|e| e.to_string())) {
             Ok(observation) => observation,
@@ -225,6 +268,45 @@ impl Server {
             content.push(ContentBlock::image(BASE64.encode(png), "image/png"));
         }
         CallToolResult::success(content)
+    }
+
+    #[tool(
+        description = "Wait until an element matching `find` and/or `role` appears in a window, \
+                       or with `gone` until none is left, instead of sleeping. Returns the \
+                       matching lines as observe would, with refs usable at once, or an error \
+                       after timeout_ms. Either way, refs from earlier observes stop working."
+    )]
+    async fn wait_for(
+        &self,
+        Parameters(p): Parameters<WaitForParams>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let policy = match self.policy() {
+            Ok(policy) => policy,
+            Err(message) => return failure(message),
+        };
+        let request = WaitRequest {
+            window_id: p.window_id,
+            filter: Filter::new(p.find, p.role, false, None),
+            gone: p.gone.unwrap_or(false),
+            max_edge: DEFAULT_MAX_EDGE,
+        };
+        let timeout = Duration::from_millis(p.timeout_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS));
+        let session = self.session.clone();
+        // rmcp does not drop a handler whose request the client cancels; it
+        // only cancels this token, so the wait itself has to check it.
+        let cancel = context.ct;
+        // rmcp calls tool handlers on the runtime's worker threads; a wait of
+        // up to 30 s there would hold a worker other requests need.
+        let waited = tokio::task::spawn_blocking(move || {
+            session.wait_for(&policy, request, timeout, WAIT_POLL, &|| cancel.is_cancelled())
+        })
+        .await;
+        match waited {
+            Ok(Ok(found)) => text(found),
+            Ok(Err(error)) => failure(error.to_string()),
+            Err(error) => failure(format!("wait_for stopped unexpectedly: {error}")),
+        }
     }
 
     #[tool(
@@ -308,6 +390,27 @@ impl Server {
     }
 }
 
+/// `id app (bundle) "title" WxH` and the state words that apply, in a fixed order.
+fn window_line(listed: &ListedWindow) -> String {
+    let w = &listed.window;
+    let mut line = format!(
+        "{} {} ({}) \"{}\" {}x{}",
+        w.id,
+        one_line(&w.app_name),
+        w.bundle_id.as_deref().unwrap_or_default(),
+        one_line(&w.title),
+        w.frame.width.round(),
+        w.frame.height.round()
+    );
+    for (applies, word) in [(listed.frontmost, "frontmost"), (listed.thumbnail, "thumbnail"), (!w.on_screen, "off-screen")] {
+        if applies {
+            let _ = write!(line, " {word}");
+        }
+    }
+    line.push('\n');
+    line
+}
+
 fn text(message: impl Into<String>) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(message)])
 }
@@ -320,12 +423,45 @@ fn failure(message: String) -> CallToolResult {
     name = "look-at-this",
     instructions = "See and control the windows of macOS apps the user has allowed. \
                     Only the user can change the allowed list. Start with doctor, then \
-                    list_windows, then observe; act with click, type_text, press_key, scroll, \
-                    and observe again to check the result."
+                    list_windows, then observe; a window listed as thumbnail or off-screen needs \
+                    activate first. Act with click, type_text, press_key, scroll, and observe \
+                    again to check the result; to wait for the UI to change, use wait_for rather \
+                    than sleeping."
 )]
 impl ServerHandler for Server {}
 
 pub async fn serve(server: Server) -> Result<(), Box<dyn Error + Send + Sync>> {
     server.serve(stdio()).await?.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::{Rect, WindowInfo};
+
+    fn listed(frontmost: bool, thumbnail: bool, on_screen: bool) -> ListedWindow {
+        let window = WindowInfo {
+            id: 7,
+            pid: 70,
+            bundle_id: Some("com.apple.TextEdit".to_string()),
+            app_name: "TextEdit".to_string(),
+            title: "Notes.txt".to_string(),
+            frame: Rect { x: 0.0, y: 0.0, width: 99.4, height: 116.0 },
+            on_screen,
+        };
+        ListedWindow { window, frontmost, thumbnail }
+    }
+
+    #[test]
+    fn window_line_ends_with_the_state_words_that_apply() {
+        assert_eq!(
+            window_line(&listed(false, false, true)),
+            "7 TextEdit (com.apple.TextEdit) \"Notes.txt\" 99x116\n"
+        );
+        assert_eq!(
+            window_line(&listed(true, true, false)),
+            "7 TextEdit (com.apple.TextEdit) \"Notes.txt\" 99x116 frontmost thumbnail off-screen\n"
+        );
+    }
 }

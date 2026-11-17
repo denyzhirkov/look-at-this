@@ -75,9 +75,26 @@ impl Input for MacInput {
         // Connects this process to the window server (see screen.rs).
         CGMainDisplayID();
         let app = ui_tree::application(pid)?;
-        let window = ui_tree::find_window(&app, pid, window_id)?;
+        let window = match ui_tree::lookup_window(&app, pid, window_id)? {
+            Some(window) => window,
+            // On screen but not exposed by its app: the usual explanation.
+            None if on_screen(window_id) => ui_tree::find_window(&app, pid, window_id)?,
+            // The window server lists it, accessibility does not: nothing
+            // here can raise it, and observe would only send the agent back.
+            None => return Err(format!(
+                "window {window_id} cannot be brought to the front: it is on another Space, where \
+                 accessibility does not reach it, or it has just closed. Call list_windows; if it \
+                 is still listed, ask the user to switch to its Space or move it to this one"
+            )),
+        };
         if in_place(&app, &window, window_id).is_some() {
             return Ok(());
+        }
+        // Raising does not bring a minimised window back from the Dock.
+        let minimised = ui_tree::flag(&window, "AXMinimized") == Ok(Some(true));
+        if minimised {
+            ui_tree::set_attribute(&window, &CFString::from_static_str("AXMinimized"), CFBoolean::new(false))
+                .map_err(|status| activation_error(status, pid))?;
         }
         // Setting AXFrontmost works from a background process without a run
         // loop, unlike NSRunningApplication activation since macOS 14.
@@ -93,12 +110,19 @@ impl Input for MacInput {
             if now.is_some() && now == last {
                 return Ok(());
             }
+            if minimised && now.is_none() {
+                // A window still coming back from the Dock ignores the first
+                // raise, and another window of the app stays in front. Only
+                // then: raising again would otherwise fight a user who has
+                // just pressed the emergency stop and picked another window.
+                let _ = ui_tree::perform_action(&window, &CFString::from_static_str("AXRaise"));
+            }
             last = now;
         }
         Err(format!(
             "window {window_id} did not come to the front at its full size within {} s. Its app may \
-             be showing a dialog, the window may be on another Space or minimised, or the user may \
-             be switching apps; call observe to see the current state, then try again",
+             be showing a dialog, the window may be on another Space, or the user may be switching \
+             apps; call list_windows to see the current state, then try again",
             ACTIVATE_TIMEOUT.as_secs()
         ))
     }
@@ -229,16 +253,20 @@ fn topmost(window: u32, point: CGPoint) -> bool {
 }
 
 fn on_screen(window: u32) -> bool {
-    let infos = window_infos(CGWindowListOption::OptionIncludingWindow, window);
+    window_infos(CGWindowListOption::OptionIncludingWindow, window).first().is_some_and(|info| shown(info))
+}
+
+/// Whether a window description from the window server says it is on screen.
+pub(super) fn shown(info: &CFDictionary<CFString, CFType>) -> bool {
     // SAFETY: a CoreGraphics constant, valid for the life of the process.
     let key = unsafe { kCGWindowIsOnscreen };
-    infos.first().and_then(|info| info.get(key)).and_then(|v| v.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool))
-        == Some(true)
+    info.get(key).and_then(|v| v.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool)) == Some(true)
 }
 
 /// The window's on-screen bounds, provided its app is frontmost, it is the
-/// app's main or key window, and it is drawn at its real frame: not as a
-/// Stage Manager thumbnail, and not part way through the animation out of one.
+/// app's main or key window, it is on screen, and it is drawn at its real
+/// frame: not as a Stage Manager thumbnail, and not part way through the
+/// animation out of one.
 fn in_place(app: &AXUIElement, window: &AXUIElement, window_id: u32) -> Option<Rect> {
     let frontmost = ui_tree::flag(app, "AXFrontmost") == Ok(Some(true));
     // A window without the attribute cannot be main; it is judged by its frame.
@@ -271,16 +299,32 @@ fn activation_error(status: AXError, pid: i32) -> String {
 }
 
 /// Window descriptions from the window server, front to back.
-fn window_infos(option: CGWindowListOption, window: u32) -> Vec<CFRetained<CFDictionary<CFString, CFType>>> {
+pub(super) fn window_infos(
+    option: CGWindowListOption,
+    window: u32,
+) -> Vec<CFRetained<CFDictionary<CFString, CFType>>> {
     let Some(list) = CGWindowListCopyWindowInfo(option, window) else { return Vec::new() };
     // SAFETY: the window list is an array of dictionaries with string keys.
     let list = unsafe { list.cast_unchecked::<CFDictionary>() };
     list.iter().map(|info| unsafe { CFRetained::cast_unchecked(info) }).collect()
 }
 
-/// Where the window server draws the window now, in screen points.
+/// Where the window server draws the window now, in screen points; `None`
+/// unless it is on screen. A window on another Space keeps its bounds, and
+/// raising it there can make it main without switching to that Space.
 fn window_bounds(window: u32) -> Option<Rect> {
     let info = window_infos(CGWindowListOption::OptionIncludingWindow, window).into_iter().next()?;
+    if !shown(&info) {
+        return None;
+    }
+    bounds(&info)
+}
+
+/// A window description's bounds, in screen points with the origin at the
+/// top-left of the main display: the space of SCWindow.frame (equal for every
+/// on-screen window compared live) and of accessibility frames, which
+/// `in_place` compares them with.
+pub(super) fn bounds(info: &CFDictionary<CFString, CFType>) -> Option<Rect> {
     // SAFETY: a CoreGraphics constant, valid for the life of the process.
     let bounds = info.get(unsafe { kCGWindowBounds })?;
     let bounds = bounds.downcast_ref::<CFDictionary>()?;

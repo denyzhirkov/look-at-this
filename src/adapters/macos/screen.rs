@@ -1,13 +1,19 @@
-//! Window list and window screenshots via ScreenCaptureKit.
+//! Window list and window screenshots via ScreenCaptureKit, plus off-screen
+//! windows from the window server.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 use block2::RcBlock;
-use objc2::rc::Retained;
-use objc2::{AnyThread, msg_send};
-use objc2_core_foundation::{CFMutableData, CFString, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGImage, CGMainDisplayID};
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::{AnyThread, ClassType, msg_send};
+use objc2_app_kit::NSRunningApplication;
+use objc2_core_foundation::{CFDictionary, CFMutableData, CFNumber, CFString, CFType, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::{
+    CGImage, CGMainDisplayID, CGWindowListOption, kCGWindowLayer, kCGWindowName, kCGWindowNumber,
+    kCGWindowOwnerName, kCGWindowOwnerPID, kCGWindowSharingState,
+};
 use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_image_io::CGImageDestination;
 use objc2_screen_capture_kit::{
@@ -15,6 +21,8 @@ use objc2_screen_capture_kit::{
     SCStreamConfiguration, SCStreamErrorCode, SCWindow,
 };
 
+use super::input::{bounds, shown, window_infos};
+use super::ui_tree;
 use crate::ports::{PortResult, Rect, ScreenCapture, WindowInfo, WindowSource};
 
 /// ScreenCaptureKit answers within milliseconds; longer means it is stuck.
@@ -31,9 +39,21 @@ pub struct MacScreen;
 
 impl WindowSource for MacScreen {
     fn windows(&self) -> PortResult<Vec<WindowInfo>> {
-        with_content(|content, done| {
+        // Read before ScreenCaptureKit is asked, not right after it answers:
+        // in that order its next request was often dropped (8 to 14 of 30
+        // calls never answered); in this order none of 90 were.
+        let off_screen = off_screen_windows();
+        let mut windows: Vec<WindowInfo> = with_content(|content, done| {
             let _ = done.send(Ok(windows(content).iter().filter_map(|w| window_info(w)).collect()));
-        })
+        })?;
+        // A window that came on screen in between is listed as on screen.
+        let ids: Vec<u32> = windows.iter().map(|w| w.id).collect();
+        windows.extend(off_screen.into_iter().filter(|w| !ids.contains(&w.id)));
+        Ok(windows)
+    }
+
+    fn frontmost_pid(&self) -> Option<i32> {
+        ui_tree::frontmost_pid()
     }
 }
 
@@ -141,14 +161,15 @@ fn windows(content: &SCShareableContent) -> Vec<Retained<SCWindow>> {
     windows.map(|w| w.to_vec()).unwrap_or_default()
 }
 
-/// `None` for anything that is not an ordinary visible app window.
+/// `None` for anything that is not an ordinary app window.
 fn window_info(window: &SCWindow) -> Option<WindowInfo> {
     let app = unsafe { window.owningApplication() }?;
     // SCWindow.frame is in global display points, origin at the top-left of
     // the main display: the same space as WindowInfo.frame.
     let frame = unsafe { window.frame() };
-    let ordinary = unsafe { APP_WINDOW_LAYERS.contains(&window.windowLayer()) && window.isOnScreen() };
-    if !ordinary || frame.size.width < MIN_WINDOW_EDGE || frame.size.height < MIN_WINDOW_EDGE {
+    let on_screen = unsafe { window.isOnScreen() };
+    let title = unsafe { window.title() }.map(|t| t.to_string()).unwrap_or_default();
+    if !is_app_window(unsafe { window.windowLayer() }, frame.size, on_screen, &title) {
         return None;
     }
     let bundle_id: Option<Retained<NSString>> = unsafe { msg_send![&*app, bundleIdentifier] };
@@ -158,14 +179,98 @@ fn window_info(window: &SCWindow) -> Option<WindowInfo> {
         pid: unsafe { app.processID() },
         bundle_id: bundle_id.map(|id| id.to_string()).filter(|id| !id.is_empty()),
         app_name: app_name.map(|name| name.to_string()).unwrap_or_default(),
-        title: unsafe { window.title() }.map(|t| t.to_string()).unwrap_or_default(),
+        title,
         frame: Rect {
             x: frame.origin.x,
             y: frame.origin.y,
             width: frame.size.width,
             height: frame.size.height,
         },
+        on_screen,
     })
+}
+
+/// Titled app windows that are not on screen (minimised, hidden, on another
+/// Space or in a hidden Stage Manager strip).
+///
+/// They come from the window server's own list, not from ScreenCaptureKit:
+/// asked for off-screen windows too, ScreenCaptureKit silently dropped about
+/// a third of the requests inside this server (11 or 12 of 30 never answered,
+/// against none of 30 for on-screen windows only).
+fn off_screen_windows() -> Vec<WindowInfo> {
+    let mut apps = HashMap::new();
+    let all = CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements;
+    // SAFETY (all keys below): CoreGraphics constants, valid for the life of the process.
+    window_infos(all, 0)
+        .iter()
+        .filter(|info| !shown(info))
+        .filter_map(|info| {
+            let id = u32::try_from(number(info, unsafe { kCGWindowNumber })?).ok()?;
+            let layer = isize::try_from(number(info, unsafe { kCGWindowLayer })?).ok()?;
+            let frame = bounds(info)?;
+            // A window whose app turned sharing off (state 0) is not for
+            // capture tools; ScreenCaptureKit leaves such windows out too.
+            if number(info, unsafe { kCGWindowSharingState }) == Some(0) {
+                return None;
+            }
+            // Window titles are only given to processes with Screen Recording
+            // permission, which this server needs anyway; without it every
+            // title is empty and the rule drops the window.
+            let title = text(info, unsafe { kCGWindowName });
+            let size = CGSize::new(frame.width, frame.height);
+            if !is_app_window(layer, size, false, &title) {
+                return None;
+            }
+            let pid = i32::try_from(number(info, unsafe { kCGWindowOwnerPID })?).ok()?;
+            let (bundle_id, app_name) = apps.entry(pid).or_insert_with(|| running_app(pid)).clone();
+            Some(WindowInfo {
+                id,
+                pid,
+                bundle_id,
+                app_name: app_name.unwrap_or_else(|| text(info, unsafe { kCGWindowOwnerName })),
+                title,
+                frame,
+                on_screen: false,
+            })
+        })
+        .collect()
+}
+
+/// Bundle id and name of the app with process id `pid`; `None` for what is
+/// unknown, and for both if the process is not an app.
+fn running_app(pid: i32) -> (Option<String>, Option<String>) {
+    // NSRunningApplication may be used from any thread; its bundle id and
+    // name are fixed, so the main run loop's update policy does not matter.
+    // msg_send! because the crate binds this method only with its libc feature.
+    // The pool: this runs on runtime threads that never exit, where
+    // autoreleased temporaries would otherwise pile up for the whole session.
+    autoreleasepool(|_| {
+        let app: Option<Retained<NSRunningApplication>> =
+            unsafe { msg_send![NSRunningApplication::class(), runningApplicationWithProcessIdentifier: pid] };
+        let Some(app) = app else { return (None, None) };
+        let bundle_id = app.bundleIdentifier().map(|id| id.to_string()).filter(|id| !id.is_empty());
+        (bundle_id, app.localizedName().map(|name| name.to_string()))
+    })
+}
+
+fn number(info: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
+    info.get(key)?.downcast_ref::<CFNumber>()?.as_i64()
+}
+
+/// Empty if the description has no such string.
+fn text(info: &CFDictionary<CFString, CFType>, key: &CFString) -> String {
+    info.get(key).and_then(|v| v.downcast_ref::<CFString>().map(CFString::to_string)).unwrap_or_default()
+}
+
+/// Whether a window is one the user works with, rather than a system layer
+/// or an invisible helper.
+fn is_app_window(layer: isize, size: CGSize, on_screen: bool, title: &str) -> bool {
+    APP_WINDOW_LAYERS.contains(&layer)
+        && size.width >= MIN_WINDOW_EDGE
+        && size.height >= MIN_WINDOW_EDGE
+        // Apps keep untitled helper windows off screen (TextEdit has several
+        // 1512x33 ones); a window the user can bring back has a title.
+        && (on_screen || !title.is_empty())
 }
 
 fn encode_png(image: &CGImage, width: u32, height: u32) -> PortResult<Vec<u8>> {
@@ -208,4 +313,21 @@ fn sck_error(action: &str, error: *mut NSError) -> String {
         );
     }
     format!("{action} failed: {description}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn off_screen_windows_are_kept_only_with_a_title() {
+        let document = CGSize::new(673.0, 439.0);
+        assert!(is_app_window(0, document, true, ""));
+        assert!(is_app_window(0, document, false, "Untitled"), "minimised or hidden");
+        // TextEdit's untitled off-screen helpers.
+        assert!(!is_app_window(0, CGSize::new(1512.0, 33.0), false, ""));
+        assert!(!is_app_window(0, CGSize::new(1.0, 1.0), true, "x"), "too small even on screen");
+        assert!(!is_app_window(0, CGSize::new(1512.0, 10.0), false, "x"), "too small off screen too");
+        assert!(!is_app_window(25, document, true, "Menu"), "a system layer");
+    }
 }

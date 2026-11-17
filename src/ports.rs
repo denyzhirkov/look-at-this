@@ -36,12 +36,19 @@ pub struct WindowInfo {
     pub title: String,
     /// Screen points, origin at the top-left of the main display.
     pub frame: Rect,
+    /// False when the window is minimised, its app is hidden, or it is on
+    /// another Space or in a hidden Stage Manager strip.
+    pub on_screen: bool,
 }
 
 pub trait WindowSource: Send + Sync {
-    /// Ordinary on-screen application windows of every app (no menu bar,
-    /// Dock, or other system layers). Filtering by policy is the domain's job.
+    /// Ordinary application windows of every app (no menu bar, Dock, or
+    /// other system layers): those on screen, and those with a title that are
+    /// not (apps keep untitled helper windows off screen). Filtering by
+    /// policy is the domain's job.
     fn windows(&self) -> PortResult<Vec<WindowInfo>>;
+    /// Process id of the frontmost app; `None` if it cannot be told.
+    fn frontmost_pid(&self) -> Option<i32>;
 }
 
 pub trait ScreenCapture: Send + Sync {
@@ -85,6 +92,10 @@ pub struct UiTreeSnapshot {
 pub trait UiTree: Send + Sync {
     /// Accessibility tree of one window, reading at most `max_nodes` elements.
     fn tree(&self, pid: i32, window_id: u32, max_nodes: usize) -> PortResult<UiTreeSnapshot>;
+    /// The window's frame as accessibility reports it now, in the same space
+    /// as [`WindowInfo::frame`]; `None` if it reports none. Issues no element
+    /// handles, so those of the latest [`UiTree::tree`] stay valid.
+    fn window_frame(&self, pid: i32, window_id: u32) -> PortResult<Option<Rect>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -67,8 +67,8 @@ password managers and the agent hosts themselves. The list is in
 Press **ctrl+option+cmd+escape** to pause all agent input. A notice appears in
 the middle of the screen; press the same keys to resume.
 
-While paused, every click, key and scroll is refused, a text being typed is cut
-short, and `doctor` reports the pause. Looking (`observe`) still works. The
+While paused, every click, key, scroll and `activate` is refused, a text being typed is cut
+short, and `doctor` reports the pause. Looking (`observe`, `wait_for`) still works. The
 pause applies to every running server and survives restarts: only you lift it.
 
 ## Tools
@@ -76,8 +76,11 @@ pause applies to every running server and survives restarts: only you lift it.
 | Tool | What it does |
 |---|---|
 | `doctor` | Permissions, allowed apps, pause state, and what to fix. |
-| `list_windows` | Open windows of allowed apps, with their ids. |
+| `list_windows` | Open windows of allowed apps, with their ids, including minimised and hidden ones. Each line ends with the state words that apply: `frontmost`, `thumbnail` (Stage Manager shows only a thumbnail), `off-screen` (minimised, hidden or on another Space). |
+| `activate` | Bring a window and its app to the front, un-minimising it if needed. Required before `observe` or any action on a `thumbnail` or `off-screen` window. |
 | `observe` | A window's element tree and/or screenshot. `screenshot: "none"` is the cheapest; `"region"` with a `ref` returns a magnified view of one element; `max_edge` limits the image size. |
+| `observe` filters | `find` (text in label or value), `role` (e.g. `button`), `interactive` (controls only) and `max_depth` print only part of the tree; conditions combine. Matches of `find`, `role` or `interactive` are listed flat, and a last line tells how many elements are shown; refs of hidden elements still work. |
+| `wait_for` | Wait until an element matching `find` and/or `role` appears, or with `gone` until none is left. Returns the matches as `observe` would, with fresh refs; `timeout_ms` defaults to 5000, at most 30000. Refs from earlier observes stop working, even when it times out. |
 | `click` | Click an element by `ref`, or a screenshot pixel by `x`,`y`. Options: `button`, `double`, `mode`. |
 | `type_text` | Put text into an element by `ref`, or type into whatever has focus. `replace` swaps the whole content. |
 | `press_key` | A key or shortcut such as `enter` or `cmd+s`. |
@@ -98,8 +101,9 @@ only and fails rather than move the pointer or bring the app forward.
   system-wide, so system shortcuts such as Spotlight or the app switcher cannot
   be triggered.
 - **Password fields.** Their values are never read. Typing into them is allowed.
-- **Stale refs fail.** A ref from an earlier `observe`, another window or
-  another process is refused, never resolved to a different element.
+- **Stale refs fail.** A ref from before the latest `observe` or `wait_for`,
+  from another window or another process is refused, never resolved to a
+  different element.
 
 ### What it does not protect against
 
@@ -111,9 +115,15 @@ only and fails rather than move the pointer or bring the app forward.
 
 ## Known limitations
 
-- **Stage Manager.** A background app's window is only a thumbnail there: it
-  cannot be captured until the app is brought forward, and its dialogs are not
-  listed.
+- **Stage Manager.** A background app's window is only a thumbnail there, or
+  off screen while the strip is hidden: `list_windows` marks it, and it cannot
+  be observed or acted on until `activate` brings it forward. Its dialogs are
+  not listed.
+- **Other Spaces and hidden apps.** `activate` un-minimises a window reliably.
+  A window on another Space is listed as `off-screen` but cannot be brought
+  forward: apps report only the current Space's windows to accessibility, so
+  `activate` refuses and asks for the user. A hidden app's window is best
+  effort and may time out.
 - **Keyboard layout** is read when the server starts. After switching to a
   different Latin layout, restart the server or shortcuts may hit other keys.
 - **Typing with real keys** is paced at roughly 150 characters a second so the

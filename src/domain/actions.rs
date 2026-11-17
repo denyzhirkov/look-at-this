@@ -3,6 +3,7 @@
 use crate::domain::keys;
 use crate::domain::policy::AccessPolicy;
 use crate::domain::session::{Error, Session};
+use crate::domain::snapshot::one_line;
 use crate::domain::viewport::clamp_to_window;
 use crate::ports::{
     Button, ElementHandle, Input, Key, KeyCombo, Modifiers, Point, Rect, UiAction, WindowInfo,
@@ -150,6 +151,20 @@ impl Session {
         Ok(format!("scrolled; {} was brought to the front", window.app_name))
     }
 
+    /// Brings a window to the front, including one that is off screen or only
+    /// a Stage Manager thumbnail, so it can be observed and acted on.
+    pub fn activate(&self, policy: &AccessPolicy, window_id: u32) -> Result<String, Error> {
+        self.ensure_running()?;
+        let window = self.permitted_window(policy, window_id)?;
+        self.input()?.activate(window.pid, window.id).map_err(Error::System)?;
+        Ok(format!(
+            "{} is in front with window {} \"{}\"; observe it to see its current state",
+            one_line(&window.app_name),
+            window.id,
+            one_line(&window.title)
+        ))
+    }
+
     /// The real-input port, unless the user has hit the emergency stop. Asked
     /// for anew before every single delivery: bringing a window forward can
     /// take seconds, and that is exactly when a user reaches for the stop.
@@ -278,6 +293,7 @@ mod tests {
             tree: true,
             reference: None,
             max_edge: 1000,
+            filter: Default::default(),
         };
         session.observe(&policy(), request).unwrap();
         (session, fake)
@@ -292,7 +308,7 @@ mod tests {
         let (session, fake) = observed(Fake { accessible: true, ..Fake::default() });
         session.click(&policy(), 1, &save(), Button::Left, false, Mode::Background).unwrap();
         session.click(&policy(), 1, &save(), Button::Right, false, Mode::Auto).unwrap();
-        assert_eq!(fake.log(), ["ax Press 7", "ax ShowMenu 7"]);
+        assert_eq!(fake.log(), ["ax Press 107", "ax ShowMenu 107"]);
     }
 
     #[test]
@@ -314,7 +330,7 @@ mod tests {
         let (session, fake) =
             observed(Fake { accessible: true, button_moved_to: Some(far), ..Fake::default() });
         session.click(&policy(), 1, &save(), Button::Left, false, Mode::Auto).unwrap();
-        assert_eq!(fake.log(), ["ax Press 7"]);
+        assert_eq!(fake.log(), ["ax Press 107"]);
         assert!(fake.pointed.lock().unwrap().is_empty());
 
         // Refused actions show nothing.
@@ -468,7 +484,7 @@ mod tests {
     fn text_goes_through_accessibility_or_is_typed_after_focusing() {
         let (session, fake) = observed(Fake { accessible: true, ..Fake::default() });
         session.type_text(&policy(), 1, Some(SAVE), "hi", true, Mode::Auto).unwrap();
-        assert_eq!(fake.log(), ["ax insert 7 \"hi\" replace=true"]);
+        assert_eq!(fake.log(), ["ax insert 107 \"hi\" replace=true"]);
 
         let (session, fake) = observed(Fake::default());
         session.type_text(&policy(), 1, Some(SAVE), "hi", true, Mode::Auto).unwrap();
@@ -532,6 +548,44 @@ mod tests {
         let long = "x".repeat(100);
         assert_eq!(session.type_text(&p, 1, None, &long, false, Mode::Auto), Err(Error::Paused));
         assert_eq!(fake.log(), ["activate pid 1 window 1".to_string(), format!("type pid 1 {:?}", "x".repeat(40))]);
+    }
+
+    #[test]
+    fn actions_on_an_off_screen_window_touch_nothing() {
+        let (session, fake) = session_with(Fake { accessible: true, off_screen: vec![1], ..Fake::default() });
+        let p = policy();
+        let pixel = At::Pixel { x: 10.0, y: 10.0 };
+        assert_eq!(session.click(&p, 1, &pixel, Button::Left, false, Mode::Auto), Err(Error::OffScreen(1)));
+        assert_eq!(session.type_text(&p, 1, None, "hi", false, Mode::Auto), Err(Error::OffScreen(1)));
+        assert_eq!(session.press_key(&p, 1, "enter"), Err(Error::OffScreen(1)));
+        assert_eq!(session.scroll(&p, 1, None, 0, 1), Err(Error::OffScreen(1)));
+        assert!(fake.log().is_empty(), "{:?}", fake.log());
+        assert!(fake.pointed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn activate_brings_allowed_windows_forward_wherever_they_are() {
+        let (session, fake) = session_with(Fake::default());
+        let done = session.activate(&policy(), 1).unwrap();
+        assert!(done.contains("com.apple.TextEdit") && done.contains("window 1"), "{done}");
+
+        let (session, fake_off) = session_with(Fake { off_screen: vec![1], ..Fake::default() });
+        session.activate(&policy(), 1).unwrap();
+        assert_eq!(fake.log(), ["activate pid 1 window 1"]);
+        assert_eq!(fake_off.log(), ["activate pid 1 window 1"]);
+    }
+
+    #[test]
+    fn activate_is_refused_for_apps_that_are_not_allowed_and_when_paused() {
+        let (session, fake) = session_with(Fake { off_screen: vec![2], ..Fake::default() });
+        let p = policy();
+        assert_eq!(session.activate(&p, 2), Err(Error::NotAllowed("com.apple.Notes".to_string())));
+        assert_eq!(session.activate(&p, 3), Err(Error::Forbidden("com.apple.Terminal".to_string())));
+        assert!(matches!(session.activate(&p, 4), Err(Error::Unidentified(_))));
+        assert_eq!(session.activate(&p, 9), Err(Error::WindowNotFound(9)));
+        *fake.paused.lock().unwrap() = true;
+        assert_eq!(session.activate(&p, 1), Err(Error::Paused));
+        assert!(fake.log().is_empty(), "{:?}", fake.log());
     }
 
     #[test]

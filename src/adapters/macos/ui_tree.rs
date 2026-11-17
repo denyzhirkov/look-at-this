@@ -45,6 +45,8 @@ const FOCUSED: usize = 7;
 unsafe extern "C" {
     /// Declared here because the crate's wrapper panics on NULL.
     fn AXUIElementCreateApplication(pid: i32) -> Option<NonNull<AXUIElement>>;
+    /// Declared here for the same reason.
+    fn AXUIElementCreateSystemWide() -> Option<NonNull<AXUIElement>>;
     /// Private but long-stable: the CGWindowID behind an AX window element.
     fn _AXUIElementGetWindow(element: &AXUIElement, window_id: *mut u32) -> AXError;
 }
@@ -122,6 +124,12 @@ impl UiTree for MacUiTree {
         live.generation = generation;
         live.elements = walker.elements;
         Ok(UiTreeSnapshot { root, truncated: walker.truncated })
+    }
+
+    fn window_frame(&self, pid: i32, window_id: u32) -> PortResult<Option<Rect>> {
+        let app = application(pid)?;
+        let window = find_window(&app, pid, window_id)?;
+        frame(&window).map_err(|status| ax_error(status, pid))
     }
 }
 
@@ -279,23 +287,43 @@ pub(super) fn application(pid: i32) -> PortResult<CFRetained<AXUIElement>> {
         .ok_or_else(|| ax_error(AXError::Failure, pid))
 }
 
+/// Process id of the frontmost app, asked of accessibility now: AppKit's
+/// own answer goes stale off the main run loop. `None` if it cannot be read.
+pub(super) fn frontmost_pid() -> Option<i32> {
+    // SAFETY: returns a +1 reference (Create rule) or NULL.
+    let system = unsafe { AXUIElementCreateSystemWide() }.map(|e| unsafe { CFRetained::from_raw(e) })?;
+    // On the system-wide element this also sets the process-wide default
+    // timeout, to the value every request here sets for itself anyway.
+    let app = copy_attribute(&system, &CFString::from_static_str("AXFocusedApplication")).ok()??;
+    pid(app.downcast_ref::<AXUIElement>()?).ok()
+}
+
 pub(super) fn find_window(app: &AXUIElement, pid: i32, window_id: u32) -> PortResult<CFRetained<AXUIElement>> {
+    lookup_window(app, pid, window_id)?.ok_or_else(|| {
+        format!(
+            "window {window_id} is not among its app's accessibility windows: it may have \
+             just closed (call list_windows), or the app does not expose it (call observe \
+             with tree false for a screenshot only)"
+        )
+    })
+}
+
+/// `None` if the app does not report this window to accessibility. Apps
+/// report only the windows of the current Space.
+pub(super) fn lookup_window(
+    app: &AXUIElement,
+    pid: i32,
+    window_id: u32,
+) -> PortResult<Option<CFRetained<AXUIElement>>> {
     let windows = copy_attribute(app, &CFString::from_static_str("AXWindows")).map_err(|e| ax_error(e, pid))?;
-    elements(windows.as_deref().and_then(|w| w.downcast_ref::<CFArray>()))
+    Ok(elements(windows.as_deref().and_then(|w| w.downcast_ref::<CFArray>()))
         .into_iter()
         .find(|w| {
             let mut id = 0;
             // SAFETY: `w` is a valid element and `id` a valid out-pointer.
             let status = unsafe { _AXUIElementGetWindow(w, &mut id) };
             status == AXError::Success && id == window_id
-        })
-        .ok_or_else(|| {
-            format!(
-                "window {window_id} is not among its app's accessibility windows: it may have \
-                 just closed (call list_windows), or the app does not expose it (call observe \
-                 with tree false for a screenshot only)"
-            )
-        })
+        }))
 }
 
 /// What one slot of a multiple-attribute read held.
