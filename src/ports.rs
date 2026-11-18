@@ -96,6 +96,9 @@ pub trait UiTree: Send + Sync {
     /// as [`WindowInfo::frame`]; `None` if it reports none. Issues no element
     /// handles, so those of the latest [`UiTree::tree`] stay valid.
     fn window_frame(&self, pid: i32, window_id: u32) -> PortResult<Option<Rect>>;
+    /// Whether the window is its app's main window, the one the app's menu
+    /// bar acts on. Issues no element handles.
+    fn is_main_window(&self, pid: i32, window_id: u32) -> PortResult<bool>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -104,6 +107,87 @@ pub enum UiAction {
     Press,
     /// What a right-click does: open its context menu.
     ShowMenu,
+}
+
+/// An element's `AXValue` as accessibility reports it now.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiveValue {
+    /// No value, or one of a kind not listed here.
+    None,
+    /// A number; a boolean is reported as 0 or 1.
+    Number(f64),
+    Text(String),
+    /// The element is a secure (password) field, so its value was not read.
+    Secret,
+}
+
+/// What a control is and holds right now, read live rather than from a tree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlState {
+    /// Platform role, e.g. `AXCheckBox`.
+    pub role: String,
+    pub enabled: bool,
+    pub value: LiveValue,
+    /// Whether `AXValue` accepts being set.
+    pub settable: bool,
+    /// `AXMinValue` and `AXMaxValue`, when reported as numbers.
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// One item of a pop-up button's menu.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuOption {
+    /// Empty for a separator.
+    pub title: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuChoice {
+    /// The chosen item was pressed and the menu has closed.
+    Pressed,
+    /// Nothing was chosen and the menu was closed again; these were its items.
+    Cancelled(Vec<MenuOption>),
+}
+
+/// Menus the system puts into every app's menu bar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MenuKind {
+    /// Any menu or item of the app.
+    App,
+    /// The Apple menu: the first title of the menu bar.
+    Apple,
+    /// The item holding the Services submenu, which hands content to other apps.
+    Services,
+    /// An item of the Services submenu: a service, or the settings for them.
+    ServicesItem,
+}
+
+/// One item of an app's menu bar or of one of its menus.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuItem {
+    /// As the app reports it; empty for a separator.
+    pub title: String,
+    pub enabled: bool,
+    /// The item shows a mark, such as a checkmark.
+    pub checked: bool,
+    pub has_submenu: bool,
+    /// The keyboard shortcut, when it is a printable key (lower case) with
+    /// modifiers; `None` when there is none or it is some other key.
+    pub shortcut: Option<(Modifiers, char)>,
+    pub kind: MenuKind,
+    /// Screen points; reported for menu-bar titles only.
+    pub frame: Option<Rect>,
+}
+
+/// One step down from the menu bar: the item at `index` among the items
+/// [`UiActions::menu_items`] lists at that level, which must still carry
+/// exactly this title.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuStep {
+    pub index: usize,
+    pub title: String,
 }
 
 /// Acting on elements through accessibility: no pointer, no focus change.
@@ -120,6 +204,32 @@ pub trait UiActions: Send + Sync {
     /// Inserts `text` at the element's insertion point, or replaces its whole
     /// content. `Ok(false)` if the element does not accept text this way.
     fn insert_text(&self, element: ElementHandle, text: &str, replace: bool) -> PortResult<bool>;
+    /// Reads the element's role, enabled flag and value now. Never reads the
+    /// value of a secure field.
+    fn control(&self, element: ElementHandle) -> PortResult<ControlState>;
+    /// Sets the element's `AXValue` to a number.
+    fn set_number(&self, element: ElementHandle, value: f64) -> PortResult<()>;
+    /// Opens a pop-up button's menu and presses the item `pick` chooses among
+    /// its items, in menu order; returns `Pressed` once the menu has closed,
+    /// so the new value can be read. When `pick` chooses none, or anything
+    /// fails once the menu is open, the menu is closed again before
+    /// returning: it is never left open.
+    fn choose_option(
+        &self,
+        element: ElementHandle,
+        pick: &dyn Fn(&[MenuOption]) -> Option<usize>,
+    ) -> PortResult<MenuChoice>;
+    /// The items of the menu that `path` leads to from the menu bar of
+    /// process `pid` (the menu-bar titles for an empty path), separators
+    /// included, in menu order; empty if the last item has no submenu. Read
+    /// without opening any menu. `Ok(None)` if an item of `path` is no longer
+    /// at its index with its title, or is now of a [`MenuKind`] other than
+    /// `App`. Issues no element handles.
+    fn menu_items(&self, pid: i32, path: &[MenuStep]) -> PortResult<Option<Vec<MenuItem>>>;
+    /// Presses the item `path` leads to, without opening any menu, after
+    /// checking every item of `path` still has its title there and is of
+    /// kind `App`; `Ok(false)`, with nothing pressed, if one is not.
+    fn press_menu_item(&self, pid: i32, path: &[MenuStep]) -> PortResult<bool>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -164,6 +274,50 @@ pub struct KeyCombo {
     pub key: Key,
 }
 
+/// How an [`Input::drag`] ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DragOutcome {
+    /// The button was released at the end point.
+    Dropped,
+    /// The window was not the topmost window at the start point: nothing
+    /// was pressed.
+    NotOnTop,
+    /// A point of the drag's path is not on any display: nothing was pressed.
+    OffDisplay,
+    /// The drag was cancelled instead of dropped.
+    Cancelled { why: DragCancel, undo: DragUndo },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DragCancel {
+    /// The window was no longer the topmost window at a point of the path,
+    /// or at the end no longer at the frame it had at the press.
+    Covered,
+    /// `stop` said so between two steps.
+    Stopped,
+    /// The pointer was not where the last step had put it: the user moved
+    /// the mouse.
+    PointerMoved,
+}
+
+/// Where a cancelled drag released the button. What is dragged by
+/// drag-and-drop lands on whatever is under the pointer at the release.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DragUndo {
+    /// Back at the start point, after retracing the path.
+    AtStart,
+    /// The way back to the start was covered, so at the point of the path
+    /// nearest the start that the pointer reached back over points where the
+    /// window was still the topmost window, itself such a point.
+    OnPath,
+    /// The point right behind the pointer was covered, or the release point
+    /// was by the time the pointer got there: Escape went to the window's
+    /// process, to cancel a drag-and-drop, before the release where the
+    /// pointer was. An app that is not in a drag-and-drop gets that Escape
+    /// as an ordinary key press.
+    Escaped,
+}
+
 /// Real input, as a person would produce it.
 pub trait Input: Send + Sync {
     /// Brings the app, and that window of it, to the front. Returns once it
@@ -183,6 +337,38 @@ pub trait Input: Send + Sync {
     /// down, positive `dx` further right), then puts the pointer back.
     /// Same topmost-window rule and `Ok(false)` as [`Input::click`].
     fn scroll(&self, window_id: u32, point: Point, dx: i32, dy: i32) -> PortResult<bool>;
+    /// Presses the left button at `from`, moves the real pointer to `to` in
+    /// small steps, releases it there, then puts the pointer back; about
+    /// 1.1 s in all.
+    ///
+    /// Every point of the path must be on a display, or nothing is pressed
+    /// ([`DragOutcome::OffDisplay`]). The press follows the rule of
+    /// [`Input::click`]: [`DragOutcome::NotOnTop`], with nothing pressed,
+    /// unless `window_id` is the topmost window at `from` before the pointer
+    /// moves and again right before the press. After each step `stop` is
+    /// asked, the pointer must still be where the step put it, and
+    /// `window_id` must be the topmost window there. Right before the release
+    /// it must still be the topmost window at `to` and at the frame it had at
+    /// the press. When any of that fails the drag is cancelled, not dropped:
+    /// the pointer retraces its path, only over points where `window_id` is
+    /// the topmost window now, and the button is released at the one of them
+    /// nearest `from`. If the point right behind the pointer is not one, or
+    /// the release point no longer is when the pointer gets there, Escape is
+    /// sent to process `pid` and the button is released where the pointer is
+    /// ([`DragUndo`]).
+    ///
+    /// Every return releases the button. Nothing does when the process dies
+    /// mid-drag (it aborts on a panic; it can be killed): the system then
+    /// keeps the button down until the user's next click. An error means
+    /// nothing was pressed.
+    fn drag(
+        &self,
+        pid: i32,
+        window_id: u32,
+        from: Point,
+        to: Point,
+        stop: &dyn Fn() -> bool,
+    ) -> PortResult<DragOutcome>;
     /// Types text into the focused element of process `pid`. The keys go to
     /// that process only, never to another app or to system-wide shortcuts.
     fn type_text(&self, pid: i32, text: &str) -> PortResult<()>;

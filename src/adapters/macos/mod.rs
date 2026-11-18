@@ -3,6 +3,7 @@
 mod consent;
 mod input;
 mod keyboard;
+mod menu;
 mod overlay;
 mod pause;
 mod permissions;

@@ -26,6 +26,16 @@ pub enum At {
     Pixel { x: f64, y: f64 },
 }
 
+/// Where real input will land, as far as it can be known before the window
+/// is brought forward.
+pub(super) enum Aim<'a> {
+    /// The middle of the window.
+    Middle,
+    /// Points from the window's top-left.
+    Offset(f64, f64),
+    Element(&'a String, ElementHandle),
+}
+
 /// Characters typed between two checks of the emergency stop.
 const TYPING_PORTION: usize = 40;
 
@@ -168,13 +178,13 @@ impl Session {
     /// The real-input port, unless the user has hit the emergency stop. Asked
     /// for anew before every single delivery: bringing a window forward can
     /// take seconds, and that is exactly when a user reaches for the stop.
-    fn input(&self) -> Result<&dyn Input, Error> {
+    pub(super) fn input(&self) -> Result<&dyn Input, Error> {
         self.ensure_running()?;
         Ok(self.ports.input.as_ref())
     }
 
     /// Refuses once the user has hit the emergency stop.
-    fn ensure_running(&self) -> Result<(), Error> {
+    pub(super) fn ensure_running(&self) -> Result<(), Error> {
         match self.ports.pause.is_paused() {
             true => Err(Error::Paused),
             false => Ok(()),
@@ -188,7 +198,7 @@ impl Session {
     ///
     /// Read before the action: afterwards the app may be busy with what the
     /// action started, and the reply must not wait for it.
-    fn cursor_point(&self, window: &WindowInfo, handle: ElementHandle) -> Option<Point> {
+    pub(super) fn cursor_point(&self, window: &WindowInfo, handle: ElementHandle) -> Option<Point> {
         let frame = self.ports.actions.frame(handle).ok()??;
         let centre = Point { x: frame.x + frame.width / 2.0, y: frame.y + frame.height / 2.0 };
         let on_screen = window.frame;
@@ -198,7 +208,7 @@ impl Session {
     }
 
     /// The cursor marks delivered actions only, so it is shown afterwards.
-    fn show_cursor(&self, point: Option<Point>) {
+    pub(super) fn show_cursor(&self, point: Option<Point>) {
         if let Some(point) = point {
             self.ports.overlay.point_at(point);
         }
@@ -223,27 +233,35 @@ impl Session {
         if mode == Mode::Background {
             return Err(Error::NeedsRealInput);
         }
-        // Whatever can be refused without disturbing the user is checked first.
-        let pixel = match at {
+        let aim = self.aim(window, at)?;
+        self.input()?.activate(window.pid, window.id).map_err(Error::System)?;
+        let frame = self.current_frame(window)?;
+        self.aim_point(window, frame, aim)
+    }
+
+    /// The part of finding a point that can be refused without disturbing
+    /// the user, so it comes before the window is brought forward.
+    pub(super) fn aim<'a>(&self, window: &WindowInfo, at: Option<&'a At>) -> Result<Aim<'a>, Error> {
+        match at {
             Some(At::Pixel { x, y }) => {
                 let view = self.state.lock().unwrap().view;
                 let (_, viewport) = view.filter(|(id, _)| *id == window.id).ok_or(Error::NoView)?;
-                Some(viewport.window_point(*x, *y).ok_or(Error::PointOutside)?)
+                let (dx, dy) = viewport.window_point(*x, *y).ok_or(Error::PointOutside)?;
+                Ok(Aim::Offset(dx, dy))
             }
-            _ => None,
-        };
-        let element = match at {
-            Some(At::Element(reference)) => Some((reference, self.element(window, reference)?)),
-            _ => None,
-        };
-        self.input()?.activate(window.pid, window.id).map_err(Error::System)?;
+            Some(At::Element(reference)) => Ok(Aim::Element(reference, self.element(window, reference)?)),
+            None => Ok(Aim::Middle),
+        }
+    }
 
-        // Positions are read only now: bringing an app forward can move its
-        // windows (Stage Manager), and content may have scrolled since observe.
-        let frame = self.current_frame(window)?;
-        let Some((reference, handle)) = element else {
-            let (dx, dy) = pixel.unwrap_or((frame.width / 2.0, frame.height / 2.0));
-            return Ok(Point { x: frame.x + dx, y: frame.y + dy });
+    /// The screen point of `aim` in the window's current `frame`. Read only
+    /// once the window is in front: bringing an app forward can move its
+    /// windows (Stage Manager), and content may have scrolled since observe.
+    pub(super) fn aim_point(&self, window: &WindowInfo, frame: Rect, aim: Aim) -> Result<Point, Error> {
+        let (reference, handle) = match aim {
+            Aim::Middle => return Ok(Point { x: frame.x + frame.width / 2.0, y: frame.y + frame.height / 2.0 }),
+            Aim::Offset(dx, dy) => return Ok(Point { x: frame.x + dx, y: frame.y + dy }),
+            Aim::Element(reference, handle) => (reference, handle),
         };
         // The middle of the part inside the window: a document view can be
         // far taller than the window, with its own middle off-screen.
@@ -264,7 +282,7 @@ impl Session {
     }
 
     /// The window's frame now, provided it still belongs to the same process.
-    fn current_frame(&self, window: &WindowInfo) -> Result<Rect, Error> {
+    pub(super) fn current_frame(&self, window: &WindowInfo) -> Result<Rect, Error> {
         self.ports
             .windows
             .windows()
@@ -279,25 +297,9 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::session::{ObserveRequest, Shot};
-    use crate::domain::testing::{Fake, policy, session_with};
+    use crate::domain::testing::{Fake, observed, policy, session_with};
 
     const SAVE: &str = "e2";
-
-    /// A session that has observed window 1 at half scale (1000x500 px).
-    fn observed(fake: Fake) -> (Session, std::sync::Arc<Fake>) {
-        let (session, fake) = session_with(fake);
-        let request = ObserveRequest {
-            window_id: 1,
-            screenshot: Shot::None,
-            tree: true,
-            reference: None,
-            max_edge: 1000,
-            filter: Default::default(),
-        };
-        session.observe(&policy(), request).unwrap();
-        (session, fake)
-    }
 
     fn save() -> At {
         At::Element(SAVE.to_string())

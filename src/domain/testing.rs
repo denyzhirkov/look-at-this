@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::domain::policy::AccessPolicy;
 use crate::domain::session::{Ports, Session};
+use crate::domain::session::{ObserveRequest, Shot};
 use crate::ports::{
-    Button, ElementHandle, Input, KeyCombo, Overlay, Pause, Point, PortResult, Rect, ScreenCapture, UiAction,
-    UiActions, UiNode, UiTree, UiTreeSnapshot, WindowInfo, WindowSource,
+    Button, ControlState, DragCancel, DragOutcome, DragUndo, ElementHandle, Input, KeyCombo, LiveValue, MenuChoice, MenuItem, MenuKind, MenuOption, MenuStep,
+    Overlay, Pause, Point, PortResult, Rect, ScreenCapture, UiAction, UiActions, UiNode, UiTree, UiTreeSnapshot,
+    WindowInfo, WindowSource,
 };
 
 /// Four windows: 1 TextEdit (allowed), 2 Notes (not allowed), 3 Terminal
@@ -54,6 +56,46 @@ pub struct Fake {
     pub renamed_after_reads: Option<u32>,
     /// After this many tree reads only a Stage Manager thumbnail is shown.
     pub thumbnail_after_reads: Option<u32>,
+    /// What accessibility reports for the button read live; `None` reports
+    /// a plain button. An accessible press flips a toggle (a radio button or
+    /// a mixed checkbox turns on), and set_value updates it.
+    pub control: Mutex<Option<ControlState>>,
+    /// Step that a number set on the control snaps to.
+    pub step: Option<f64>,
+    /// Items of the menu the control opens as a pop-up button.
+    pub options: Vec<MenuOption>,
+    /// Whether the user hits the emergency stop while that menu opens.
+    pub pause_once_menu_open: bool,
+    /// Whether the control can be read only once: every later read fails.
+    pub control_read_once: bool,
+    pub control_reads: Mutex<u32>,
+    /// The menu bar of TextEdit (pid 1).
+    pub menu_bar: Vec<FakeMenu>,
+    /// Whether window 1 is not TextEdit's main window.
+    pub not_main: bool,
+    /// Whether the user hits the emergency stop while the menus are read.
+    pub pause_once_menu_read: bool,
+    /// The title the item to press has by the time it is pressed.
+    pub renamed_at_press: Option<String>,
+    /// The kind the item to press has by the time it is pressed.
+    pub kind_at_press: Option<MenuKind>,
+    /// The size window 1 has once it has been brought forward.
+    pub resized_on_activate: Option<(f64, f64)>,
+    /// A slider at this screen frame after the button: handle N08, and `e3`
+    /// in `observed`.
+    pub slider: Option<Rect>,
+    /// How a drag that was started ends; `None` drops it.
+    pub drag_outcome: Option<DragOutcome>,
+    /// Where a drag cut short by the emergency stop is released; `None`: at its start.
+    pub drag_undo: Option<DragUndo>,
+    /// Whether the user hits the emergency stop once a drag has started.
+    pub pause_once_dragging: bool,
+}
+
+/// A menu item and, if it has a submenu, that submenu's items.
+pub struct FakeMenu {
+    pub item: MenuItem,
+    pub items: Vec<FakeMenu>,
 }
 
 impl Fake {
@@ -78,6 +120,31 @@ impl Fake {
         }
         Ok(element % 100 == 7)
     }
+
+    /// Whether `element` is the slider of the latest tree, if there is one.
+    fn is_slider(&self, element: ElementHandle) -> bool {
+        self.slider.is_some() && element == u64::from(*self.tree_reads.lock().unwrap()) * 100 + 8
+    }
+
+    /// The items `path` leads to, checked the way the real adapter checks
+    /// them; `None` if an item is not at its index with its title, or is not
+    /// of kind `App`.
+    fn menu_level(&self, path: &[MenuStep]) -> Option<&[FakeMenu]> {
+        let mut level = self.menu_bar.as_slice();
+        for step in path {
+            let fits = |menu: &&FakeMenu| menu.item.title == step.title && menu.item.kind == MenuKind::App;
+            level = &level.get(step.index).filter(fits)?.items;
+        }
+        Some(level)
+    }
+}
+
+/// `Format > Font`, or `menu bar` for the empty path.
+fn menu_path(path: &[MenuStep]) -> String {
+    match path.is_empty() {
+        true => "menu bar".to_string(),
+        false => path.iter().map(|step| step.title.as_str()).collect::<Vec<_>>().join(" > "),
+    }
 }
 
 /// Handle of the button in tree read `read`.
@@ -101,8 +168,14 @@ impl WindowSource for Fake {
         let mut anonymous = window(4, "", 0.0);
         anonymous.bundle_id = None;
         anonymous.app_name = "helper".to_string();
+        let mut textedit = window(1, "com.apple.TextEdit", 100.0);
+        if let Some((width, height)) = self.resized_on_activate
+            && self.log().iter().any(|entry| entry.starts_with("activate"))
+        {
+            textedit.frame = Rect { width, height, ..textedit.frame };
+        }
         let mut windows = vec![
-            window(1, "com.apple.TextEdit", 100.0),
+            textedit,
             window(2, "com.apple.Notes", 0.0),
             window(3, "com.apple.Terminal", 0.0),
             anonymous,
@@ -143,6 +216,13 @@ impl UiTree for Fake {
             enabled: true,
             ..UiNode::default()
         };
+        let slider = self.slider.map(|frame| UiNode {
+            handle: u64::from(reads) * 100 + 8,
+            role: "AXSlider".to_string(),
+            frame: Some(frame),
+            enabled: true,
+            ..UiNode::default()
+        });
         let root = UiNode {
             handle: u64::from(reads) * 100 + 1,
             role: "AXWindow".to_string(),
@@ -151,7 +231,7 @@ impl UiTree for Fake {
                 false => self.ax_frame(),
             },
             enabled: true,
-            children: vec![button],
+            children: [Some(button), slider].into_iter().flatten().collect(),
             ..UiNode::default()
         };
         Ok(UiTreeSnapshot { root, truncated: false })
@@ -164,14 +244,22 @@ impl UiTree for Fake {
             false => Ok(self.ax_frame()),
         }
     }
+
+    fn is_main_window(&self, pid: i32, window_id: u32) -> PortResult<bool> {
+        assert_eq!((pid, window_id), (1, 1), "only TextEdit's window can be asked about");
+        Ok(!self.not_main)
+    }
 }
 
 impl UiActions for Fake {
     fn is_at(&self, element: ElementHandle, _point: Point) -> PortResult<bool> {
-        Ok(self.is_button(element)? && !self.obscured)
+        Ok((self.is_button(element)? || self.is_slider(element)) && !self.obscured)
     }
 
     fn frame(&self, element: ElementHandle) -> PortResult<Option<Rect>> {
+        if self.is_slider(element) {
+            return Ok(self.slider);
+        }
         Ok(self.is_button(element)?.then_some(self.button_moved_to.unwrap_or(BUTTON_FRAME)))
     }
 
@@ -179,6 +267,14 @@ impl UiActions for Fake {
         self.is_button(element)?;
         if self.accessible {
             self.record(format!("ax {action:?} {element}"));
+        }
+        if self.accessible
+            && action == UiAction::Press
+            && let Some(state) = self.control.lock().unwrap().as_mut()
+            && let LiveValue::Number(now) = state.value
+        {
+            let on = now != 1.0 || state.role == "AXRadioButton";
+            state.value = LiveValue::Number(if on { 1.0 } else { 0.0 });
         }
         Ok(self.accessible)
     }
@@ -189,6 +285,79 @@ impl UiActions for Fake {
             self.record(format!("ax insert {element} {text:?} replace={replace}"));
         }
         Ok(self.accessible)
+    }
+
+    fn control(&self, element: ElementHandle) -> PortResult<ControlState> {
+        self.is_button(element)?;
+        let reads = {
+            let mut reads = self.control_reads.lock().unwrap();
+            *reads += 1;
+            *reads
+        };
+        if self.control_read_once && reads > 1 {
+            return Err("the element no longer exists".to_string());
+        }
+        Ok(self.control.lock().unwrap().clone().unwrap_or(ControlState {
+            role: "AXButton".to_string(),
+            enabled: true,
+            value: LiveValue::None,
+            settable: false,
+            min: None,
+            max: None,
+        }))
+    }
+
+    fn set_number(&self, element: ElementHandle, value: f64) -> PortResult<()> {
+        self.is_button(element)?;
+        self.record(format!("ax set {element} {value}"));
+        let snapped = self.step.map_or(value, |step| (value / step).round() * step);
+        if let Some(state) = self.control.lock().unwrap().as_mut() {
+            state.value = LiveValue::Number(snapped);
+        }
+        Ok(())
+    }
+
+    fn choose_option(
+        &self,
+        element: ElementHandle,
+        pick: &dyn Fn(&[MenuOption]) -> Option<usize>,
+    ) -> PortResult<MenuChoice> {
+        self.is_button(element)?;
+        self.record(format!("ax open menu {element}"));
+        if self.pause_once_menu_open {
+            *self.paused.lock().unwrap() = true;
+        }
+        let Some(chosen) = pick(&self.options) else {
+            self.record(format!("ax cancel menu {element}"));
+            return Ok(MenuChoice::Cancelled(self.options.clone()));
+        };
+        let title = self.options[chosen].title.clone();
+        self.record(format!("ax choose {element} {title}"));
+        if let Some(state) = self.control.lock().unwrap().as_mut() {
+            state.value = LiveValue::Text(title);
+        }
+        Ok(MenuChoice::Pressed)
+    }
+
+    fn menu_items(&self, pid: i32, path: &[MenuStep]) -> PortResult<Option<Vec<MenuItem>>> {
+        assert_eq!(pid, 1, "menus must be read of the access-checked app");
+        self.record(format!("menu read {}", menu_path(path)));
+        if self.pause_once_menu_read {
+            *self.paused.lock().unwrap() = true;
+        }
+        Ok(self.menu_level(path).map(|level| level.iter().map(|menu| menu.item.clone()).collect()))
+    }
+
+    fn press_menu_item(&self, pid: i32, path: &[MenuStep]) -> PortResult<bool> {
+        assert_eq!(pid, 1, "menus must be pressed in the access-checked app");
+        let (last, parents) = path.split_last().expect("a path to press");
+        let Some(item) = self.menu_level(parents).and_then(|level| level.get(last.index)) else { return Ok(false) };
+        let title = self.renamed_at_press.as_ref().unwrap_or(&item.item.title);
+        if title != &last.title || self.kind_at_press.unwrap_or(item.item.kind) != MenuKind::App {
+            return Ok(false);
+        }
+        self.record(format!("menu press {}", menu_path(path)));
+        Ok(true)
     }
 }
 
@@ -215,6 +384,22 @@ impl Input for Fake {
             self.record(format!("scroll {},{} by {dx},{dy}", point.x, point.y));
         }
         Ok(!self.covered)
+    }
+
+    fn drag(&self, pid: i32, window_id: u32, from: Point, to: Point, stop: &dyn Fn() -> bool) -> PortResult<DragOutcome> {
+        assert_eq!((pid, window_id), (1, 1), "real input must name the access-checked window");
+        if self.covered {
+            return Ok(DragOutcome::NotOnTop);
+        }
+        self.record(format!("drag {},{} -> {},{}", from.x, from.y, to.x, to.y));
+        if self.pause_once_dragging {
+            *self.paused.lock().unwrap() = true;
+        }
+        if stop() {
+            self.record("stopped".to_string());
+            return Ok(DragOutcome::Cancelled { why: DragCancel::Stopped, undo: self.drag_undo.unwrap_or(DragUndo::AtStart) });
+        }
+        Ok(self.drag_outcome.unwrap_or(DragOutcome::Dropped))
     }
 
     fn type_text(&self, pid: i32, text: &str) -> PortResult<()> {
@@ -250,6 +435,22 @@ impl Pause for Fake {
 
 pub fn session() -> (Session, Arc<Fake>) {
     session_with(Fake::default())
+}
+
+/// A session that has observed window 1 at half scale (1000x500 px); the
+/// button is then `e2`.
+pub fn observed(fake: Fake) -> (Session, Arc<Fake>) {
+    let (session, fake) = session_with(fake);
+    let request = ObserveRequest {
+        window_id: 1,
+        screenshot: Shot::None,
+        tree: true,
+        reference: None,
+        max_edge: 1000,
+        filter: Default::default(),
+    };
+    session.observe(&policy(), request).unwrap();
+    (session, fake)
 }
 
 pub fn session_with(fake: Fake) -> (Session, Arc<Fake>) {

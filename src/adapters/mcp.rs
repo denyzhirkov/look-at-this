@@ -19,6 +19,7 @@ use crate::config;
 use crate::domain::doctor;
 use crate::domain::policy::AccessPolicy;
 use crate::domain::actions::{At, Mode};
+use crate::domain::drag::drag_end;
 use crate::domain::session::{ListedWindow, ObserveRequest, Session, Shot, WaitRequest};
 use crate::domain::snapshot::{Filter, one_line};
 use crate::ports::{Button, Permissions};
@@ -160,6 +161,52 @@ struct ScrollParams {
     dy: Option<i32>,
     /// Lines to scroll right (negative: left). Default 0.
     dx: Option<i32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DragParams {
+    /// Window id from list_windows. Both ends must lie inside this window.
+    window_id: u32,
+    /// Element to start at (its visible centre), such as "e12" from the latest observe.
+    from_ref: Option<String>,
+    /// Or a pixel of the latest window screenshot to start at.
+    from_x: Option<f64>,
+    from_y: Option<f64>,
+    /// Element to end at (its visible centre).
+    to_ref: Option<String>,
+    /// Or a pixel of the latest window screenshot to end at.
+    to_x: Option<f64>,
+    to_y: Option<f64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum ControlValue {
+    Text(String),
+    Number(f64),
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SetValueParams {
+    /// Window id from list_windows.
+    window_id: u32,
+    /// The control, such as "e12" from the latest observe.
+    #[serde(rename = "ref")]
+    reference: String,
+    /// "on" or "off" for a checkbox, switch or radio button (a radio button
+    /// only "on"); a number for a slider or stepper; an option's title for a
+    /// pop-up button.
+    value: ControlValue,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MenuParams {
+    /// Window id from list_windows.
+    window_id: u32,
+    /// Menu titles joined by ">", e.g. "Format > Font > Bold". Omit to list
+    /// the menu bar. Titles match ignoring case and a trailing "…"; a title
+    /// containing ">" cannot be named.
+    path: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -348,6 +395,35 @@ impl Server {
     }
 
     #[tool(
+        description = "Set a checkbox, switch or radio button on or off, a slider or stepper to a \
+                       number, or a pop-up button to one of its options, through accessibility \
+                       only: the pointer, keyboard and focus are not used. Does nothing if the \
+                       control already has that value. The result says what the control holds \
+                       afterwards; a slider may snap to a step."
+    )]
+    fn set_value(&self, Parameters(p): Parameters<SetValueParams>) -> CallToolResult {
+        let value = match p.value {
+            ControlValue::Text(text) => text,
+            ControlValue::Number(n) => n.to_string(),
+        };
+        self.act(|session, policy| session.set_value(policy, p.window_id, &p.reference, &value))
+    }
+
+    #[tool(
+        description = "List or press items of the menu bar of a window's app through \
+                       accessibility only: no menu opens on screen, and the pointer, keyboard and \
+                       focus are not used. Without path, lists the menus. A path ending at a menu \
+                       or submenu lists its items, each with its shortcut and the words checked, \
+                       disabled, submenu that apply; a path ending at an item presses it. A press \
+                       acts on the app's main window, so window_id must be that window (call \
+                       activate first). A title containing \">\" cannot be named. The Apple and \
+                       Services menus are never available."
+    )]
+    fn menu(&self, Parameters(p): Parameters<MenuParams>) -> CallToolResult {
+        self.act(|session, policy| session.menu(policy, p.window_id, p.path.as_deref()))
+    }
+
+    #[tool(
         description = "Press a key or shortcut in a window's app, e.g. \"enter\" or \"cmd+s\". \
                        The app is brought to the front. The keys reach only that app, never \
                        system-wide shortcuts."
@@ -370,6 +446,23 @@ impl Server {
             return failure("scroll needs a non-zero `dy` or `dx`".to_string());
         }
         self.act(|session, policy| session.scroll(policy, p.window_id, at.as_ref(), dx, dy))
+    }
+
+    #[tool(
+        description = "Drag with the real pointer inside one window: press the left button at \
+                       `from` (from_ref, or from_x and from_y), move to `to` (to_ref, or to_x and \
+                       to_y) and release, e.g. to select text, move a slider or divider, or \
+                       reorder items. Brings the app to the front; takes about 1.1 s. If the \
+                       window stops being on top along the way, or the user moves the mouse, the \
+                       drag is cancelled and the result says where the button was released. \
+                       Observe again afterwards to see the effect."
+    )]
+    fn drag(&self, Parameters(p): Parameters<DragParams>) -> CallToolResult {
+        self.act(|session, policy| {
+            let from = drag_end("from", p.from_ref, p.from_x, p.from_y)?;
+            let to = drag_end("to", p.to_ref, p.to_x, p.to_y)?;
+            session.drag(policy, p.window_id, &from, &to)
+        })
     }
 
     /// Runs an action under the current policy and reports how it went.
@@ -424,9 +517,9 @@ fn failure(message: String) -> CallToolResult {
     instructions = "See and control the windows of macOS apps the user has allowed. \
                     Only the user can change the allowed list. Start with doctor, then \
                     list_windows, then observe; a window listed as thumbnail or off-screen needs \
-                    activate first. Act with click, type_text, press_key, scroll, and observe \
-                    again to check the result; to wait for the UI to change, use wait_for rather \
-                    than sleeping."
+                    activate first. Act with click, type_text, set_value, menu, press_key, scroll, \
+                    drag, and observe again to check the result; to wait for the UI to change, use \
+                    wait_for rather than sleeping."
 )]
 impl ServerHandler for Server {}
 

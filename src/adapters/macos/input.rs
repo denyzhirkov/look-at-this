@@ -17,7 +17,7 @@ use objc2_core_graphics::{
 };
 
 use super::{keyboard, ui_tree};
-use crate::ports::{Button, Input, KeyCombo, Modifiers, Point, PortResult, Rect};
+use crate::ports::{Button, DragCancel, DragOutcome, DragUndo, Input, Key, KeyCombo, Modifiers, Point, PortResult, Rect};
 
 const ACTIVATE_TIMEOUT: Duration = Duration::from_secs(3);
 const ACTIVATE_POLL: Duration = Duration::from_millis(30);
@@ -32,6 +32,17 @@ const HOVER_SETTLE: Duration = Duration::from_millis(60);
 /// kept arriving for 30 s after the emergency stop. At about 200 a second
 /// the app keeps up, and a stop between the domain's portions takes effect at once.
 const KEY_PACE: Duration = Duration::from_millis(5);
+/// A drag moves the pointer in this many steps, each a `post`, a
+/// `DRAG_STEP_PAUSE` and its checks apart, since apps ignore a press that
+/// jumps straight to its end point.
+const DRAG_STEPS: u32 = 16;
+const DRAG_STEP_PAUSE: Duration = Duration::from_millis(15);
+/// Between the press and the first step. A text view drags a selection
+/// pressed for longer than about 0.1 s and starts a new selection otherwise
+/// (TextEdit live: a 75 ms hold selected, 115 ms dragged).
+const DRAG_HOLD: Duration = Duration::from_millis(200);
+/// After Escape is sent to cancel a drag-and-drop, before the release.
+const ESCAPE_SETTLE: Duration = Duration::from_millis(100);
 const EVENT_FAILED: &str = "CoreGraphics could not create an input event; nothing was sent; try again";
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -54,6 +65,9 @@ unsafe extern "C" {
         window: *mut u32,
         owner_connection: *mut i32,
     ) -> i32;
+    /// Public; declared here because the crate binding needs a feature this
+    /// crate does not otherwise use.
+    fn CGGetDisplaysWithPoint(point: CGPoint, max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
 }
 
 pub struct MacInput {
@@ -177,6 +191,77 @@ impl Input for MacInput {
         }))
     }
 
+    fn drag(
+        &self,
+        pid: i32,
+        window_id: u32,
+        from: Point,
+        to: Point,
+        stop: &dyn Fn() -> bool,
+    ) -> PortResult<DragOutcome> {
+        let (start, end) = (CGPoint::new(from.x, from.y), CGPoint::new(to.x, to.y));
+        // Every event exists before the first is posted, as for click.
+        let moves = Moves::new(start)?;
+        let steps = (0..=DRAG_STEPS)
+            .map(|i| {
+                let t = f64::from(i) / f64::from(DRAG_STEPS);
+                let at = CGPoint::new(start.x + (end.x - start.x) * t, start.y + (end.y - start.y) * t);
+                Ok(Step {
+                    at,
+                    drag: mouse(CGEventType::LeftMouseDragged, at, CGMouseButton::Left, 1)?,
+                    up: mouse(CGEventType::LeftMouseUp, at, CGMouseButton::Left, 1)?,
+                })
+            })
+            .collect::<PortResult<Vec<_>>>()?;
+        let down = mouse(CGEventType::LeftMouseDown, start, CGMouseButton::Left, 1)?;
+        let escape = keyboard::press(KeyCombo { modifiers: Modifiers::default(), key: Key::Escape }, &self.layout)?;
+        let escape = key_events(escape.code, CGEventFlags::empty(), None)?;
+        // Off every display the pointer stops at the edge, and the path
+        // would end somewhere else than it says.
+        if !steps.iter().all(|step| on_display(step.at)) {
+            return Ok(DragOutcome::OffDisplay);
+        }
+        if !topmost(window_id, start) {
+            return Ok(DragOutcome::NotOnTop);
+        }
+        Ok(moves.around(|| {
+            if !topmost(window_id, start) {
+                return DragOutcome::NotOnTop;
+            }
+            let Some(frame) = window_bounds(window_id) else { return DragOutcome::NotOnTop };
+            post(&down);
+            let mut held = Held { pid, window_id, steps: &steps, escape: &escape, taken: 0, released: false };
+            sleep(DRAG_HOLD);
+            for (i, step) in steps.iter().enumerate().skip(1) {
+                if stop() {
+                    return DragOutcome::Cancelled { why: DragCancel::Stopped, undo: held.cancel() };
+                }
+                post(&step.drag);
+                held.taken = i;
+                sleep(DRAG_STEP_PAUSE);
+                // Positions are posted absolute, so a mouse the user moves
+                // only makes the pointer jump: caught by where it is now.
+                let at = step.at;
+                if !pointer().is_some_and(|now| (now.x - at.x).abs() < 1.0 && (now.y - at.y).abs() < 1.0) {
+                    return DragOutcome::Cancelled { why: DragCancel::PointerMoved, undo: held.cancel() };
+                }
+                // Whatever is on top gets the drag's events, and with
+                // drag-and-drop it can read what is dragged.
+                if !topmost(window_id, at) {
+                    return DragOutcome::Cancelled { why: DragCancel::Covered, undo: held.cancel() };
+                }
+            }
+            // What the drag shows (a selection, a moved thumb) is drawn
+            // before the window is asked about again.
+            sleep(HOVER_SETTLE);
+            if !topmost(window_id, end) || window_bounds(window_id) != Some(frame) {
+                return DragOutcome::Cancelled { why: DragCancel::Covered, undo: held.cancel() };
+            }
+            held.release_here();
+            DragOutcome::Dropped
+        }))
+    }
+
     fn type_text(&self, pid: i32, text: &str) -> PortResult<()> {
         for c in text.chars() {
             if c == '\n' {
@@ -207,8 +292,7 @@ struct Moves {
 
 impl Moves {
     fn new(target: CGPoint) -> PortResult<Self> {
-        let now = CGEvent::new(None).ok_or(EVENT_FAILED)?;
-        let original = CGEvent::location(Some(&now));
+        let original = pointer().ok_or(EVENT_FAILED)?;
         Ok(Self {
             there: mouse(CGEventType::MouseMoved, target, CGMouseButton::Left, 0)?,
             back: mouse(CGEventType::MouseMoved, original, CGMouseButton::Left, 0)?,
@@ -216,13 +300,100 @@ impl Moves {
     }
 
     /// Runs `act` with the pointer at the target, then always puts it back.
-    fn around(&self, act: impl FnOnce() -> bool) -> bool {
+    fn around<T>(&self, act: impl FnOnce() -> T) -> T {
         post(&self.there);
         sleep(HOVER_SETTLE);
         let done = act();
         post(&self.back);
         done
     }
+}
+
+/// One point of a drag's path, with the events that move there and release there.
+struct Step {
+    at: CGPoint,
+    drag: CFRetained<CGEvent>,
+    up: CFRetained<CGEvent>,
+}
+
+/// The left button, pressed for a drag. Each return from the drag releases
+/// it, through `release_here` or `cancel`, and dropping it unreleased
+/// cancels. A process that dies mid-drag releases nothing (see `Input::drag`).
+struct Held<'a> {
+    pid: i32,
+    window_id: u32,
+    /// The drag's path, the start first.
+    steps: &'a [Step],
+    escape: &'a [CFRetained<CGEvent>; 2],
+    /// Index of the step the pointer is at.
+    taken: usize,
+    released: bool,
+}
+
+impl Held<'_> {
+    fn release_here(&mut self) {
+        self.released = true;
+        post(&self.steps[self.taken].up);
+    }
+
+    /// Releases the button as close to the start as is safe: something
+    /// dragged by drag-and-drop lands wherever the pointer is at the release,
+    /// and is shown to whatever the pointer crosses on the way there, so
+    /// only where the window is on top and only back over such points.
+    fn cancel(&mut self) -> DragUndo {
+        self.released = true;
+        // Hit tests do not need the pointer there, so the point is found
+        // before the pointer moves, and it never goes back over a covered one.
+        if let Some(i) = retreat(self.taken, |i| topmost(self.window_id, self.steps[i].at)) {
+            for step in self.steps[i..self.taken].iter().rev() {
+                post(&step.drag);
+            }
+            self.taken = i;
+            // Asked again: retracing takes time.
+            if topmost(self.window_id, self.steps[i].at) {
+                post(&self.steps[i].up);
+                return if i == 0 { DragUndo::AtStart } else { DragUndo::OnPath };
+            }
+        }
+        let [down, up] = self.escape;
+        CGEvent::post_to_pid(self.pid, Some(down));
+        CGEvent::post_to_pid(self.pid, Some(up));
+        sleep(ESCAPE_SETTLE);
+        post(&self.steps[self.taken].up);
+        DragUndo::Escaped
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.cancel();
+        }
+    }
+}
+
+/// The step a cancelled drag goes back to for its release, with the pointer
+/// at step `taken`: the one nearest the start that is reached over free
+/// steps only, itself free (`free` is asked from `taken - 1` down and no
+/// further than the first step that is not). `None` when the step right
+/// behind the pointer is not free, or the start is not with the pointer
+/// still on it. The step the pointer is on is otherwise not asked about:
+/// leaving it shows nothing more to what covers it.
+fn retreat(taken: usize, free: impl Fn(usize) -> bool) -> Option<usize> {
+    (0..taken.max(1)).rev().take_while(|&i| free(i)).last()
+}
+
+/// Whether `point` is on one of the displays.
+fn on_display(point: CGPoint) -> bool {
+    let mut count = 0;
+    // SAFETY: a null display list with a zero maximum only counts; `count` is a valid out-pointer.
+    let status = unsafe { CGGetDisplaysWithPoint(point, 0, std::ptr::null_mut(), &mut count) };
+    status == 0 && count > 0
+}
+
+/// Where the pointer is now.
+fn pointer() -> Option<CGPoint> {
+    CGEvent::new(None).map(|now| CGEvent::location(Some(&now)))
 }
 
 /// True only if a click at `point` would reach `window` now. Anything
@@ -358,6 +529,15 @@ fn post(event: &CGEvent) {
 /// skips the system's event routing, so system-wide shortcuts (Spotlight,
 /// the app switcher, screenshots) never see the key.
 fn post_key(pid: i32, code: CGKeyCode, flags: CGEventFlags, text: Option<char>) -> PortResult<()> {
+    // Both exist before either is posted, so a key is never left held down.
+    let [down, up] = key_events(code, flags, text)?;
+    CGEvent::post_to_pid(pid, Some(&down));
+    CGEvent::post_to_pid(pid, Some(&up));
+    Ok(())
+}
+
+/// The press and the release of a key.
+fn key_events(code: CGKeyCode, flags: CGEventFlags, text: Option<char>) -> PortResult<[CFRetained<CGEvent>; 2]> {
     let key = |down| -> PortResult<CFRetained<CGEvent>> {
         let event = CGEvent::new_keyboard_event(None, code, down).ok_or(EVENT_FAILED)?;
         CGEvent::set_flags(Some(&event), flags);
@@ -369,11 +549,7 @@ fn post_key(pid: i32, code: CGKeyCode, flags: CGEventFlags, text: Option<char>) 
         }
         Ok(event)
     };
-    // Both exist before either is posted, so a key is never left held down.
-    let (down, up) = (key(true)?, key(false)?);
-    CGEvent::post_to_pid(pid, Some(&down));
-    CGEvent::post_to_pid(pid, Some(&up));
-    Ok(())
+    Ok([key(true)?, key(false)?])
 }
 
 fn modifier_flags(modifiers: Modifiers) -> CGEventFlags {
@@ -400,5 +576,37 @@ mod tests {
     fn positive_scroll_reveals_content_below_and_to_the_right() {
         assert_eq!(wheel_deltas(0, 3), (-3, 0));
         assert_eq!(wheel_deltas(-2, -1), (1, 2));
+    }
+
+    #[test]
+    fn cancelled_drag_goes_back_only_over_free_steps() {
+        let to = |taken: usize, covered: &[usize]| retreat(taken, |i| !covered.contains(&i));
+        // The whole travelled path is free: back to the start.
+        assert_eq!(to(10, &[]), Some(0));
+        // Only the step the pointer is on is covered: it is left behind.
+        assert_eq!(to(10, &[10]), Some(0));
+        // Covered from step 4 on: never back through steps 9..4 to the free start.
+        assert_eq!(to(10, &[4, 5, 6, 7, 8, 9, 10]), None);
+        // The start is covered: the last free step before it.
+        assert_eq!(to(10, &[0, 1, 2]), Some(3));
+        // A covered stretch in the middle is not crossed.
+        assert_eq!(to(10, &[5]), Some(6));
+        // The step right behind the pointer is covered, wherever the pointer is.
+        assert_eq!(to(10, &[9]), None);
+        assert_eq!(to(1, &[0]), None);
+        // The pointer has not left the start.
+        assert_eq!(to(0, &[]), Some(0));
+        assert_eq!(to(0, &[0]), None);
+    }
+
+    #[test]
+    fn cancelled_drag_asks_no_further_than_the_first_covered_step() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let found = retreat(10, |i| {
+            asked.borrow_mut().push(i);
+            i > 7
+        });
+        assert_eq!(found, Some(8));
+        assert_eq!(*asked.borrow(), [9, 8, 7]);
     }
 }

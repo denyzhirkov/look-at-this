@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::domain::controls::number;
 use crate::domain::policy::{Access, AccessPolicy};
 use crate::domain::snapshot::{Filter, RefError, Snapshot, one_line};
 use crate::domain::viewport::{Viewport, clamp_to_window, is_thumbnail};
 use crate::ports::{
-    ElementHandle, Input, Overlay, Pause, Rect, ScreenCapture, UiActions, UiTree, WindowInfo, WindowSource,
+    DragUndo, ElementHandle, Input, Overlay, Pause, Rect, ScreenCapture, UiActions, UiTree, WindowInfo, WindowSource,
 };
 
 /// Upper bound on accessibility elements read per observe.
@@ -84,6 +85,43 @@ pub enum Error {
     /// What was waited for, whether it was to disappear, and for how long.
     WaitTimedOut { filter: String, gone: bool, waited_ms: u128 },
     WaitCancelled,
+    /// set_value does not work on this element; `why` says what to use instead.
+    NotSettable { reference: String, role: String, why: &'static str },
+    Disabled(String),
+    /// The value does not fit the control; `accepted` says what does.
+    BadValue { reference: String, accepted: &'static str },
+    OutOfRange { reference: String, value: f64, min: Option<f64>, max: Option<f64> },
+    /// The pop-up has no such option, or it is disabled; the menu was closed again.
+    NoSuchOption { reference: String, value: String, options: Vec<String>, disabled: bool },
+    /// A menu path with an empty title in it.
+    BadMenuPath,
+    /// The menu at `menu` (empty: the menu bar) has no item `title`;
+    /// `available` lists the titles it has.
+    NoMenuItem { menu: String, title: String, available: Vec<String> },
+    AmbiguousMenuItem { menu: String, title: String },
+    /// The Apple menu, or else the Services menu or an item of it, named by `title`.
+    ForbiddenMenu { title: String, apple: bool },
+    /// An empty submenu of the application menu, which may be the Services
+    /// menu before the app fills it.
+    UnloadedMenu(String),
+    /// The item at this path has no submenu for the rest of the path.
+    NoSubmenu(String),
+    MenuItemDisabled(String),
+    NotMainWindow(u32),
+    /// An item at this path moved or was renamed after it was found.
+    MenuChanged(String),
+    /// A drag end given as neither a ref nor a pixel, or as a mix; names the end.
+    BadDragEnd(&'static str),
+    /// This end of a drag is outside the window.
+    DragOutside(&'static str),
+    DragSamePoint,
+    /// Something covered the start point of a drag, so nothing was pressed.
+    DragNotStarted,
+    /// Part of the drag's path is on no display, so nothing was pressed.
+    DragOffDisplay,
+    /// The drag was cancelled instead of dropped: why, and where the button
+    /// was released instead.
+    DragCancelled { why: &'static str, undo: DragUndo },
     System(String),
 }
 
@@ -172,6 +210,127 @@ impl fmt::Display for Error {
                  earlier observes no longer work: call observe to see the current state"
             ),
             Self::WaitCancelled => write!(f, "the wait was cancelled. Call observe to see the current state"),
+            Self::NotSettable { reference, role, why } => {
+                write!(f, "{reference} ({role}) cannot be set with set_value: {why}")
+            }
+            Self::Disabled(r) => write!(f, "{r} is disabled, so it cannot be changed now"),
+            Self::BadValue { reference, accepted } => write!(f, "{reference} accepts {accepted}"),
+            Self::OutOfRange { reference, value, min, max } => {
+                write!(f, "{value} is outside the range of {reference}:")?;
+                match (min, max) {
+                    (Some(min), Some(max)) => write!(f, " {} to {}", number(*min), number(*max)),
+                    (Some(min), None) => write!(f, " at least {}", number(*min)),
+                    (None, Some(max)) => write!(f, " at most {}", number(*max)),
+                    (None, None) => Ok(()),
+                }
+            }
+            Self::NoSuchOption { reference, value, options, disabled } => {
+                match disabled {
+                    true => write!(f, "option \"{value}\" of {reference} is disabled")?,
+                    false => write!(f, "{reference} has no option \"{value}\"")?,
+                }
+                let options: Vec<String> = options.iter().map(|o| format!("\"{o}\"")).collect();
+                write!(f, "; its menu was closed again. Options: {}", options.join(", "))
+            }
+            Self::BadMenuPath => write!(
+                f,
+                "a menu path is titles joined by \">\", such as \"Format > Font > Bold\", with none empty"
+            ),
+            Self::NoMenuItem { menu, title, available } => {
+                match menu.is_empty() {
+                    true => write!(f, "the menu bar has no menu \"{title}\". Menus: ")?,
+                    false => write!(f, "{menu} has no item \"{title}\". Items: ")?,
+                }
+                match available.is_empty() {
+                    true => write!(
+                        f,
+                        "none; the app may fill this menu only when it is opened on screen, which \
+                         this tool does not do"
+                    ),
+                    false => {
+                        let available: Vec<String> = available.iter().map(|t| format!("\"{t}\"")).collect();
+                        write!(f, "{}", available.join(", "))
+                    }
+                }
+            }
+            Self::AmbiguousMenuItem { menu, title } => {
+                let menu = if menu.is_empty() { "the menu bar" } else { menu };
+                write!(
+                    f,
+                    "\"{title}\" matches several items of {menu}; give the title exactly as listed \
+                     (items titled exactly alike cannot be told apart)"
+                )
+            }
+            Self::ForbiddenMenu { title, apple: true } => write!(
+                f,
+                "\"{title}\" is the Apple menu, which can never be listed or pressed: it reaches \
+                 System Settings, other apps, logout and shutdown"
+            ),
+            Self::ForbiddenMenu { title, apple: false } => write!(
+                f,
+                "\"{title}\" is the Services menu or part of it, which can never be listed or \
+                 pressed: it hands content to other apps and opens System Settings"
+            ),
+            Self::UnloadedMenu(path) => write!(
+                f,
+                "{path} is empty or not filled yet. An empty submenu of the application menu is \
+                 never listed or walked through: it may be the Services menu before the app fills it"
+            ),
+            Self::NoSubmenu(path) => write!(f, "{path} has no submenu, so nothing can follow it in the path"),
+            Self::MenuItemDisabled(path) => write!(f, "{path} is disabled, so it cannot be pressed now"),
+            Self::NotMainWindow(id) => write!(
+                f,
+                "window {id} is not its app's main window, and the menu bar acts on the main window. \
+                 Call activate with this window_id first, then try again"
+            ),
+            Self::MenuChanged(path) => write!(
+                f,
+                "the menu changed while it was being read: {path} is no longer where it was, so \
+                 nothing was pressed. Call menu again to see it as it is now"
+            ),
+            Self::BadDragEnd(end) => write!(
+                f,
+                "give the drag's `{end}` point as `{end}_ref`, or as both `{end}_x` and `{end}_y`, not a mix"
+            ),
+            Self::DragOutside(end) => write!(
+                f,
+                "the drag's `{end}` point is outside the window, so nothing was pressed; both ends \
+                 must lie inside it. Observe again for current positions"
+            ),
+            Self::DragSamePoint => write!(f, "the drag starts and ends at the same point; use click instead"),
+            Self::DragNotStarted => write!(
+                f,
+                "another window, a menu or a system overlay covers the drag's start point, so \
+                 nothing was pressed. If it is a menu or popover of this app, press_key escape \
+                 closes it; otherwise ask the user to uncover the window"
+            ),
+            Self::DragOffDisplay => write!(
+                f,
+                "part of the drag's path is not on any display (the window reaches past the screen), \
+                 so nothing was pressed. Use points on the visible part of the window"
+            ),
+            Self::DragCancelled { why, undo: DragUndo::AtStart } => write!(
+                f,
+                "the drag was cancelled because {why}: the pointer went back and released the button \
+                 at the start point. That is not always a clean undo (a text selection becomes a \
+                 caret at the start; a drawing app may keep the stroke), so observe before trying again"
+            ),
+            Self::DragCancelled { why, undo: DragUndo::OnPath } => write!(
+                f,
+                "the drag was cancelled because {why}, and the way back to its start was covered: the \
+                 button was released on the way back, at the last point before the cover, where the \
+                 window was still on top, so whatever was dragged was dropped there. Observe before \
+                 trying again"
+            ),
+            Self::DragCancelled { why, undo: DragUndo::Escaped } => write!(
+                f,
+                "the drag was cancelled because {why}, and the pointer could not go back over the window \
+                 to a safe point: Escape was sent to the app to cancel any drag-and-drop, then the \
+                 button was released where the pointer was, possibly over what covers the window. \
+                 The app may also have acted on that Escape (closed a sheet or popover, reverted an \
+                 edit). Tell the user, who should check that nothing landed there, and observe \
+                 before trying again"
+            ),
             Self::System(message) => write!(f, "{message}"),
         }
     }

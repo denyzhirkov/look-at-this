@@ -1,7 +1,7 @@
 # look-at-this
 
 An MCP server that lets AI agents see and control the windows of macOS apps
-you have allowed: look at a window, click, type, press keys, scroll.
+you have allowed: look at a window, click, type, press keys, scroll, drag.
 
 Use it to let an agent check how an app looks, fill in a form, or test what it
 has just built.
@@ -67,8 +67,8 @@ password managers and the agent hosts themselves. The list is in
 Press **ctrl+option+cmd+escape** to pause all agent input. A notice appears in
 the middle of the screen; press the same keys to resume.
 
-While paused, every click, key, scroll and `activate` is refused, a text being typed is cut
-short, and `doctor` reports the pause. Looking (`observe`, `wait_for`) still works. The
+While paused, every click, key, scroll, drag, menu press and `activate` is refused, a text being typed is cut
+short, a drag in progress is cancelled (released back where it started when that is safe), and `doctor` reports the pause. Looking (`observe`, `wait_for`, listing a `menu`) still works. The
 pause applies to every running server and survives restarts: only you lift it.
 
 ## Tools
@@ -83,8 +83,11 @@ pause applies to every running server and survives restarts: only you lift it.
 | `wait_for` | Wait until an element matching `find` and/or `role` appears, or with `gone` until none is left. Returns the matches as `observe` would, with fresh refs; `timeout_ms` defaults to 5000, at most 30000. Refs from earlier observes stop working, even when it times out. |
 | `click` | Click an element by `ref`, or a screenshot pixel by `x`,`y`. Options: `button`, `double`, `mode`. |
 | `type_text` | Put text into an element by `ref`, or type into whatever has focus. `replace` swaps the whole content. |
+| `set_value` | Set a checkbox, switch or radio button to `on` or `off`, a slider or stepper to a number, or a pop-up button to the title of one of its options, through accessibility only. Does nothing if the control already has that value, and says what it holds afterwards. |
+| `menu` | List or press items of the app's menu bar through accessibility, without opening any menu on screen. No `path` lists the menus; a `path` such as `Format > Font` lists that menu's items with their shortcut and the words `checked`, `disabled`, `submenu`; a `path` ending at an item, such as `Format > Font > Bold`, presses it. Titles match ignoring case and a trailing `…`; a title containing `>` cannot be named. A press needs `window_id` to be the app's main window (`activate` it first). |
 | `press_key` | A key or shortcut such as `enter` or `cmd+s`. |
 | `scroll` | Scroll by lines over an element, a pixel, or the middle of the window. |
+| `drag` | Press at `from` (`from_ref`, or `from_x`,`from_y`), move the real pointer to `to` (`to_ref`, or `to_x`,`to_y`) and release, inside one window: select text, move a slider or divider, reorder items. Both ends must lie inside the window, on a display, and differ. Takes about 1.1 s. |
 
 `click` and `type_text` take `mode: "background"`, which uses accessibility
 only and fails rather than move the pointer or bring the app forward.
@@ -93,14 +96,27 @@ only and fails rather than move the pointer or bring the app forward.
 
 - **Allowlist.** Every call checks the window's app against your list. Windows
   of other apps are not listed, captured, read or acted on.
-- **Real clicks are verified.** Before each press the server checks that the
-  target window is the topmost thing at that point, across all apps and system
-  layers, and for element refs that the element is really what is shown there.
-  Otherwise nothing is clicked.
+- **Real clicks and drags are verified.** Before each press the server checks
+  that the target window is the topmost thing at that point, across all apps
+  and system layers, and for element refs that the element is really what is
+  shown there. Otherwise nothing is clicked or pressed.
+- **A drag is released only where it was verified.** After each step of the
+  path and right before the release, the window must still be the topmost
+  thing under the pointer, and at the end still at the frame it had at the
+  press. If not, or if the emergency stop is hit or the mouse is moved during
+  the drag, the drag is cancelled: the pointer retraces its path and releases
+  at the start, or, when the way back is covered, at the last point before the
+  cover, crossing only points where the window was on top when the cancel began. When it cannot
+  step back at all, or the release point gets covered meanwhile, Escape is sent
+  to the app first (it cancelled a TextEdit drag-and-drop live, where a release
+  without it dropped the text into the window on top). The result says which.
 - **Keys reach only the target app.** They are delivered to that process, never
   system-wide, so system shortcuts such as Spotlight or the app switcher cannot
   be triggered.
 - **Password fields.** Their values are never read. Typing into them is allowed.
+- **System menus through `menu`.** The `menu` tool never lists or presses the
+  Apple menu or the Services menu, which reach System Settings, logout and
+  shutdown, and other apps. This holds for `menu` only (see below).
 - **Stale refs fail.** A ref from before the latest `observe` or `wait_for`,
   from another window or another process is refused, never resolved to a
   different element.
@@ -112,6 +128,8 @@ only and fails rather than move the pointer or bring the app forward.
 - An allowed app can itself open or control other apps (Finder, for example).
 - A press sent through accessibility to a window behind an open modal dialog is
   reported as delivered although the app ignores it. Observe after acting.
+- A Services keyboard shortcut sent with `press_key` is handled by the allowed
+  app and can start another app.
 
 ## Known limitations
 
@@ -130,9 +148,37 @@ only and fails rather than move the pointer or bring the app forward.
   emergency stop can cut it short. Text put in through accessibility is instant.
 - **Accessibility text insertion** changes the field's value, but some apps do
   not notice the change; real keys are more reliable there.
+- **`set_value` and combo boxes.** Pop-up buttons work; choosing from a combo
+  box's list does not, so put the text into it with `type_text` instead.
+- **`menu` state lags.** Apps refresh a menu's checkmarks and enabled items a
+  moment after a change (about a second in TextEdit), so a listing right after a
+  press may still show the old state. A menu an app fills only when it is opened
+  on screen is listed as empty. Shortcuts on keys other than printable ones (such
+  as escape or the Globe key) are left out of listings.
+- **`drag`** takes about 1.1 s: the button is held 0.2 s before the pointer
+  moves, as a person's would be, so a drag that starts inside selected text
+  moves that text rather than starting a new selection. Dragging a title bar
+  moves the window, so the drag is cancelled. Some elements, such as TextEdit's
+  ruler markers, are not found by the element check at their position: drag
+  them by `x`,`y`. A cancel is not always a clean undo: a text selection becomes
+  a caret at the start, a drawing app may keep the there-and-back stroke, and a
+  drag-and-drop is dropped onto its own origin, which most apps ignore. A
+  window of another app that comes on top during a drag-and-drop gets the drag
+  for one step (about 30 ms) before the cancel, enough to see what is dragged;
+  when the cancel is by Escape, the pointer stays over it until the release
+  0.1 s later. That Escape also arrives when nothing was being dragged and
+  dropped (a slider or a selection drag): the app then treats it as a normal
+  Escape and may close a sheet or popover, revert a field being edited or
+  leave full screen.
+- **A server that dies mid-drag** (a panic ends the process; the host may kill
+  it) leaves the button held down until your next click. A cancelled request
+  or a closed connection does not cut a drag short: it finishes first (checked
+  live).
 - **Not yet verified:** a second display, keyboard layouts other than US and
   Russian, full-screen apps and other Spaces, floating panels that never take
-  focus.
+  focus, `set_value` on steppers, switches and radio buttons, a `menu` press
+  that opens an app-modal dialog, the emergency stop in the middle of a drag
+  with a real app, Escape on drag-and-drop in apps other than TextEdit.
 
 ## Development
 

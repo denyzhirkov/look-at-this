@@ -2,6 +2,7 @@
 
 use std::ptr::{self, NonNull};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use objc2_application_services::{AXCopyMultipleAttributeOptions, AXError, AXUIElement, AXValue, AXValueType};
@@ -9,7 +10,11 @@ use objc2_core_foundation::{
     CFArray, CFBoolean, CFIndex, CFNull, CFNumber, CFRange, CFRetained, CFString, CFType, CGPoint, CGSize,
 };
 
-use crate::ports::{ElementHandle, Point, PortResult, Rect, UiAction, UiActions, UiNode, UiTree, UiTreeSnapshot};
+use super::menu;
+use crate::ports::{
+    ControlState, ElementHandle, LiveValue, MenuChoice, MenuItem, MenuOption, MenuStep, Point, PortResult, Rect,
+    UiAction, UiActions, UiNode, UiTree, UiTreeSnapshot,
+};
 
 /// Seconds one element may take to answer, so a hung app cannot block us.
 const MESSAGING_TIMEOUT_SECS: f32 = 1.5;
@@ -18,6 +23,10 @@ const TREE_DEADLINE: Duration = Duration::from_secs(4);
 /// Deeper elements are cut off, so a pathological chain cannot overflow the stack.
 const MAX_DEPTH: usize = 100;
 const SECURE_TEXT_FIELD: &str = "AXSecureTextField";
+/// How long a pop-up button's menu may take to open or close; closing fades
+/// it out over about 0.4 s (seen live).
+const MENU_DEADLINE: Duration = Duration::from_secs(2);
+const MENU_POLL: Duration = Duration::from_millis(20);
 
 /// Read in one round-trip per element. `AXValue` is read separately, and only
 /// once the element is known not to be a secure field; `AXChildren` is read
@@ -131,6 +140,12 @@ impl UiTree for MacUiTree {
         let window = find_window(&app, pid, window_id)?;
         frame(&window).map_err(|status| ax_error(status, pid))
     }
+
+    fn is_main_window(&self, pid: i32, window_id: u32) -> PortResult<bool> {
+        let app = application(pid)?;
+        let window = find_window(&app, pid, window_id)?;
+        Ok(flag(&window, "AXMain").map_err(|status| ax_error(status, pid))?.unwrap_or(false))
+    }
 }
 
 impl UiActions for MacUiTree {
@@ -197,23 +212,8 @@ impl UiActions for MacUiTree {
         if !action_names(&element).map_err(element_error)?.contains(&name) {
             return Ok(false);
         }
-        let answers = || copy_attribute(&element, &CFString::from_static_str("AXRole")).is_ok();
-        match perform_action(&element, &name) {
-            AXError::Success => Ok(true),
-            // A press that opens a modal dialog (NSAlert.runModal, seen live)
-            // returns only once the dialog closes, so the call times out with
-            // CannotComplete although the press happened. An app handles
-            // requests in order, so one that answers a read right afterwards
-            // has taken the press: it is running what the press opened, or it
-            // was merely slow and has performed it since.
-            AXError::CannotComplete if answers() => Ok(true),
-            AXError::CannotComplete => Err(
-                "the app stopped answering, so it is unknown whether the element was pressed; \
-                 call observe to check before trying again"
-                    .to_string(),
-            ),
-            status => Err(element_error(status)),
-        }
+        act(&element, &name)?;
+        Ok(true)
     }
 
     fn insert_text(&self, element: ElementHandle, text: &str, replace: bool) -> PortResult<bool> {
@@ -230,6 +230,213 @@ impl UiActions for MacUiTree {
         set_attribute(&element, &attribute, &CFString::from_str(text)).map_err(element_error)?;
         Ok(true)
     }
+
+    fn control(&self, element: ElementHandle) -> PortResult<ControlState> {
+        let element = self.live().element(element)?;
+        let (role, subrole) = (attr(&element, "AXRole"), attr(&element, "AXSubrole"));
+        let value_name = CFString::from_static_str("AXValue");
+        let value = match may_read_value(&role, &subrole) {
+            false => LiveValue::Secret,
+            true => copy_attribute(&element, &value_name).map_err(element_error)?.map_or(LiveValue::None, |v| {
+                if let Some(s) = v.downcast_ref::<CFString>() {
+                    LiveValue::Text(s.to_string())
+                } else if let Some(n) = v.downcast_ref::<CFNumber>().and_then(CFNumber::as_f64) {
+                    LiveValue::Number(n)
+                } else if let Some(b) = v.downcast_ref::<CFBoolean>() {
+                    LiveValue::Number(if b.as_bool() { 1.0 } else { 0.0 })
+                } else {
+                    LiveValue::None
+                }
+            }),
+        };
+        Ok(ControlState {
+            role: role.text(),
+            enabled: flag(&element, "AXEnabled").map_err(element_error)?.unwrap_or(true),
+            value,
+            settable: settable(&element, &value_name).map_err(element_error)?,
+            min: number(&element, "AXMinValue"),
+            max: number(&element, "AXMaxValue"),
+        })
+    }
+
+    fn set_number(&self, element: ElementHandle, value: f64) -> PortResult<()> {
+        let element = self.live().element(element)?;
+        set_attribute(&element, &CFString::from_static_str("AXValue"), &CFNumber::new_f64(value)).map_err(element_error)
+    }
+
+    fn choose_option(
+        &self,
+        element: ElementHandle,
+        pick: &dyn Fn(&[MenuOption]) -> Option<usize>,
+    ) -> PortResult<MenuChoice> {
+        let popup = self.live().element(element)?;
+        let press = CFString::from_static_str("AXPress");
+        if !action_names(&popup).map_err(element_error)?.contains(&press) {
+            return Err("it does not open its menu through accessibility; use click".to_string());
+        }
+        // Only an answer that there is no menu counts: a failed read does not.
+        let closed = || poll(|| matches!(menu_child(&popup), Ok(None)).then_some(())).is_some();
+        // A menu still fading out after an earlier choice ignores the press,
+        // which may then open the menu later, when nobody is looking for it.
+        if !closed() {
+            return Err("its menu is open already, or the app does not say whether it is; observe to \
+                        check, and press_key escape closes it"
+                .to_string());
+        }
+        if let Err(failure) = act(&popup, &press) {
+            return Err(close_stray_menu(&popup, failure));
+        }
+        let Some(menu) = poll(|| menu_child(&popup).ok().flatten()) else {
+            let failure = "pressing it showed no menu that accessibility can reach".to_string();
+            return Err(close_stray_menu(&popup, failure));
+        };
+        let chosen = choose(&menu, &press, pick);
+        // The app applies a pressed item a moment later, while the menu fades
+        // out: once it is gone, the new value can be read.
+        if matches!(chosen, Ok(MenuChoice::Pressed)) && closed() {
+            return chosen;
+        }
+        if perform_action(&menu, &CFString::from_static_str("AXCancel")) != AXError::Success || !closed() {
+            return Err("its menu could not be closed again; press_key escape closes it".to_string());
+        }
+        match chosen {
+            Ok(MenuChoice::Pressed) => Err("the option was pressed but the menu stayed open, so it was \
+                                            closed again; observe to check what it shows"
+                .to_string()),
+            chosen => chosen,
+        }
+    }
+
+    fn menu_items(&self, pid: i32, path: &[MenuStep]) -> PortResult<Option<Vec<MenuItem>>> {
+        menu::items(pid, path)
+    }
+
+    fn press_menu_item(&self, pid: i32, path: &[MenuStep]) -> PortResult<bool> {
+        menu::press(pid, path)
+    }
+}
+
+/// Presses the item of an open menu that `pick` chooses. The caller closes
+/// the menu unless this returns `Pressed`.
+fn choose(
+    menu: &AXUIElement,
+    press: &CFString,
+    pick: &dyn Fn(&[MenuOption]) -> Option<usize>,
+) -> PortResult<MenuChoice> {
+    let mut items = children(menu).map_err(element_error)?;
+    items.retain(|item| has_role(item, "AXMenuItem"));
+    let options: Vec<MenuOption> = items
+        .iter()
+        .map(|item| MenuOption {
+            title: attr(item, "AXTitle").text(),
+            enabled: flag(item, "AXEnabled").ok().flatten().unwrap_or(true),
+        })
+        .collect();
+    match pick(&options).and_then(|i| items.get(i)) {
+        Some(item) => {
+            act(item, press)?;
+            Ok(MenuChoice::Pressed)
+        }
+        None => Ok(MenuChoice::Cancelled(options)),
+    }
+}
+
+/// After a press that may have opened a menu that was not found where
+/// expected: closes an open menu among the pop-up's or its app's children.
+/// Returns `failure` saying whether a menu may still be open.
+fn close_stray_menu(popup: &AXUIElement, failure: String) -> String {
+    let app = pid(popup).ok().and_then(|pid| application(pid).ok());
+    let menu = menu_child(popup).ok().flatten().or_else(|| menu_child(app.as_deref()?).ok().flatten());
+    // As in choose_option, only an answer that there is no menu counts.
+    let gone = || {
+        let none = |element: &AXUIElement| matches!(menu_child(element), Ok(None));
+        (none(popup) && app.as_deref().is_none_or(none)).then_some(())
+    };
+    match menu {
+        Some(menu)
+            if perform_action(&menu, &CFString::from_static_str("AXCancel")) == AXError::Success
+                && poll(gone).is_some() =>
+        {
+            format!("{failure}; the menu it opened was closed again")
+        }
+        _ => format!("{failure}; a menu may still be open: observe to check, and press_key escape closes it"),
+    }
+}
+
+/// An open menu among the element's children, such as the one a pop-up
+/// button shows while it is open.
+/// A child whose role cannot be read fails the call: taking it for "no
+/// menu" could hide an open menu, or a submenu that must be checked.
+pub(super) fn menu_child(element: &AXUIElement) -> Result<Option<CFRetained<AXUIElement>>, AXError> {
+    for child in children(element)? {
+        if text(&child, "AXRole")? == "AXMenu" {
+            return Ok(Some(child));
+        }
+    }
+    Ok(None)
+}
+
+/// A string attribute; empty when absent or not a string.
+pub(super) fn text(element: &AXUIElement, name: &'static str) -> Result<String, AXError> {
+    let value = copy_attribute(element, &CFString::from_static_str(name))?;
+    Ok(value.and_then(|v| v.downcast_ref::<CFString>().map(CFString::to_string)).unwrap_or_default())
+}
+
+/// Asks `ready` until it answers or a menu has had time to open or close.
+fn poll<T>(mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + MENU_DEADLINE;
+    loop {
+        let answer = ready();
+        if answer.is_some() || Instant::now() >= deadline {
+            return answer;
+        }
+        thread::sleep(MENU_POLL);
+    }
+}
+
+/// All children of a small element such as a menu.
+pub(super) fn children(element: &AXUIElement) -> Result<Vec<CFRetained<AXUIElement>>, AXError> {
+    let children = copy_attribute(element, &CFString::from_static_str("AXChildren"))?;
+    Ok(elements(children.as_deref().and_then(|c| c.downcast_ref::<CFArray>())))
+}
+
+fn has_role(element: &AXUIElement, role: &str) -> bool {
+    matches!(attr(element, "AXRole"), Attr::Text(r) if r == role)
+}
+
+/// Performs an action the element offers.
+pub(super) fn act(element: &AXUIElement, name: &CFString) -> PortResult<()> {
+    let answers = || copy_attribute(element, &CFString::from_static_str("AXRole")).is_ok();
+    match perform_action(element, name) {
+        AXError::Success => Ok(()),
+        // A press that opens a modal dialog (NSAlert.runModal, seen live)
+        // returns only once the dialog closes, so the call times out with
+        // CannotComplete although the press happened. An app handles
+        // requests in order, so one that answers a read right afterwards
+        // has taken the press: it is running what the press opened, or it
+        // was merely slow and has performed it since.
+        AXError::CannotComplete if answers() => Ok(()),
+        AXError::CannotComplete => Err(
+            "the app stopped answering, so it is unknown whether the element was pressed; \
+             call observe to check before trying again"
+                .to_string(),
+        ),
+        status => Err(element_error(status)),
+    }
+}
+
+/// One attribute read on its own, classified like a slot of a multiple read.
+fn attr(element: &AXUIElement, name: &'static str) -> Attr {
+    match copy_attribute(element, &CFString::from_static_str(name)) {
+        Ok(None) => Attr::Absent,
+        Ok(Some(value)) => Attr::from_slot(Some(&value)),
+        Err(_) => Attr::Other,
+    }
+}
+
+/// A numeric attribute; `None` if it is absent, unreadable or not a number.
+fn number(element: &AXUIElement, name: &'static str) -> Option<f64> {
+    copy_attribute(element, &CFString::from_static_str(name)).ok()??.downcast_ref::<CFNumber>()?.as_f64()
 }
 
 /// Focuses a text element with the insertion point after its last
@@ -518,7 +725,7 @@ impl Walker {
 }
 
 /// `Ok(None)` when the element has no such attribute or it has no value.
-fn copy_attribute(element: &AXUIElement, name: &CFString) -> Result<Option<CFRetained<CFType>>, AXError> {
+pub(super) fn copy_attribute(element: &AXUIElement, name: &CFString) -> Result<Option<CFRetained<CFType>>, AXError> {
     unsafe { element.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
     let mut out: *const CFType = ptr::null();
     // SAFETY: valid element and name; `out` is a valid out-pointer.
