@@ -255,10 +255,24 @@ fn toggle(value: &LiveValue) -> Option<Toggle> {
     }
 }
 
-/// The option titled `wanted`, matched as menu titles are.
+/// The option titled `wanted`, matched as menu titles are. Options with the
+/// same title count as one, since a pop-up may repeat an option (a font
+/// under "Recently Used" and again in the full list): the first enabled of
+/// them stands for all.
 fn match_option(options: &[MenuOption], wanted: &str) -> Found {
-    let titles: Vec<&str> = options.iter().map(|o| o.title.as_str()).collect();
-    find_title(&titles, wanted)
+    let mut distinct: Vec<usize> = Vec::new();
+    for (i, option) in options.iter().enumerate() {
+        match distinct.iter_mut().find(|j| options[**j].title.trim() == option.title.trim()) {
+            Some(j) if !options[*j].enabled && option.enabled => *j = i,
+            Some(_) => {}
+            None => distinct.push(i),
+        }
+    }
+    let titles: Vec<&str> = distinct.iter().map(|&i| options[i].title.as_str()).collect();
+    match find_title(&titles, wanted) {
+        Found::One(i) => Found::One(distinct[i]),
+        other => other,
+    }
 }
 
 /// A number as trees show it: at most three decimals, since controls often
@@ -421,6 +435,16 @@ mod tests {
         let done = session.set_value(&policy(), 1, CONTROL, "bold").unwrap();
         assert_eq!(done, "chose \"bold\" in e2 through accessibility");
         assert_eq!(fake.log(), ["ax open menu 107", "ax choose 107 bold"]);
+    }
+
+    #[test]
+    fn an_option_a_popup_lists_twice_is_one_option() {
+        // A font pop-up: a header that cannot be chosen, then the font again.
+        let options = vec![option("Menlo", false), option("Times", true), option("Menlo", true), option("Menlo", true)];
+        assert_eq!(match_option(&options, "menlo"), Found::One(2), "the first that can be chosen");
+        assert_eq!(match_option(&options, "Times"), Found::One(1));
+        let options = vec![option("Bold", true), option("Bold", true), option("bold", true)];
+        assert_eq!(match_option(&options, "BOLD"), Found::Ambiguous, "different titles stay different");
     }
 
     #[test]
